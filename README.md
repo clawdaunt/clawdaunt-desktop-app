@@ -2,8 +2,6 @@
 
 macOS desktop app that connects your phone to [OpenClaw](https://github.com/openclaw) running on your Mac — one-click start, QR code pairing, zero config.
 
-> **Companion app:** [clawdaunt-expo-app](https://github.com/clawdaunt/clawdaunt-expo-app) — the iOS/Android phone client.
-
 ## How It Works
 
 ```
