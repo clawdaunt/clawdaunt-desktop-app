@@ -1022,7 +1022,7 @@ function connectGatewayWs(port: number, token: string): void {
 
       // ── Handshake: respond to connect.challenge ──
       if (msg.type === 'event' && msg.event === 'connect.challenge') {
-        send('gateway-log', `Gateway WS challenge received: ${JSON.stringify(msg)}\n`);
+        // Challenge details omitted to reduce log noise
         const { nonce, ts } = msg.payload || {};
         if (!nonce) {
           send('gateway-log', 'Gateway WS: challenge missing nonce\n');
@@ -1042,7 +1042,7 @@ function connectGatewayWs(port: number, token: string): void {
             auth: { token },
           },
         };
-        send('gateway-log', `Gateway WS sending connect: ${JSON.stringify(connectReq)}\n`);
+        // Connect request details omitted to reduce log noise (and avoid leaking token)
         ws.send(JSON.stringify(connectReq));
         return;
       }
@@ -1052,7 +1052,7 @@ function connectGatewayWs(port: number, token: string): void {
         if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = null; }
         if (msg.ok) {
           gatewayWsAuthenticated = true;
-          send('gateway-log', 'Connected to gateway WebSocket\n');
+          // Silently mark as connected — no log noise
         } else {
           send('gateway-log', `Gateway WS handshake rejected: ${JSON.stringify(msg)}\n`);
           ws.close();
@@ -1060,10 +1060,7 @@ function connectGatewayWs(port: number, token: string): void {
         return;
       }
 
-      // Log any unhandled messages during handshake for debugging
-      if (!gatewayWsAuthenticated) {
-        send('gateway-log', `Gateway WS (pre-auth): ${JSON.stringify(msg)}\n`);
-      }
+      // Skip logging unhandled pre-auth messages to reduce noise
 
       // ── Post-handshake: process gateway events ──
       if (!gatewayWsAuthenticated) return;
@@ -1207,9 +1204,19 @@ function startServer(): void {
     env: enrichedEnv(env),
   });
 
+  // Matches timestamp-prefixed infrastructure lines like:
+  //   2026-03-02T02:53:46.444Z [heartbeat] started
+  //   2026-03-02T02:59:15.873Z [canvas] host mounted at ...
+  const infraLogRe = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s+\[/;
+  const noiseWords = ['HEARTBEAT_OK', 'HEARTBEAT_FAIL', 'PONG'];
   const forwardLog = (data: Buffer) => {
     const clean = data.toString().replace(/\x1b\[[0-9;]*m/g, '');
     if (!clean.trim()) return;
+    const trimmed = clean.trimStart();
+    // Skip timestamp-prefixed [tag] infrastructure lines from the gateway binary
+    if (infraLogRe.test(trimmed)) return;
+    // Skip bare status words the gateway emits on stdout
+    if (noiseWords.includes(trimmed)) return;
     send('gateway-log', clean);
   };
   gatewayProc.stdout?.on('data', forwardLog);
