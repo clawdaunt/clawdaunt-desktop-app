@@ -9,6 +9,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
 import started from 'electron-squirrel-startup';
+import { getDeviceIdentity, signChallenge } from './device-identity';
 
 if (started) app.quit();
 
@@ -222,6 +223,61 @@ let gatewayWs: WebSocket | null = null;
 let gatewayWsRetryTimer: ReturnType<typeof setTimeout> | null = null;
 const sessions = new Map<string, { id: string; status: 'busy' | 'idle'; title: string; skill?: string; startedAt: number }>();
 
+// ── Phone WebSocket clients (connected via /ws/client) ──────────────────
+const phoneWsClients = new Set<WebSocket>();
+
+function relayToPhoneClients(msg: unknown): void {
+  const data = typeof msg === 'string' ? msg : JSON.stringify(msg);
+  for (const client of phoneWsClients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(data);
+    }
+  }
+}
+
+/**
+ * Forward a raw JSON-RPC message from a phone client to the gateway WebSocket.
+ * The proxy is a dumb pipe — phone speaks the same JSON-RPC protocol as the gateway.
+ */
+function forwardToGateway(raw: string, ws: WebSocket): void {
+  if (!gatewayWs || gatewayWs.readyState !== WebSocket.OPEN || !gatewayWsAuthenticated) {
+    // Extract request ID for the error response
+    let reqId = 'unknown';
+    try { reqId = JSON.parse(raw).id || reqId; } catch { /* ignore */ }
+    ws.send(JSON.stringify({ type: 'res', id: reqId, ok: false, payload: { error: 'Gateway not connected' } }));
+    return;
+  }
+  gatewayWs.send(raw);
+}
+
+/**
+ * Handle a message from a connected phone WebSocket client.
+ * Passthrough: all JSON-RPC requests (type: "req") are forwarded to the gateway as-is.
+ * Only "ping" is handled locally for keepalive.
+ */
+function handlePhoneWsMessage(ws: WebSocket, raw: string): void {
+  let msg: Record<string, unknown>;
+  try {
+    msg = JSON.parse(raw);
+  } catch {
+    return;
+  }
+
+  const type = msg.type as string;
+  if (!type) return;
+
+  if (type === 'ping') {
+    ws.send(JSON.stringify({ type: 'pong' }));
+    return;
+  }
+
+  // Forward all JSON-RPC requests to gateway as-is
+  if (type === 'req') {
+    forwardToGateway(raw, ws);
+    return;
+  }
+}
+
 function send(channel: string, data: unknown) {
   mainWindow?.webContents.send(channel, data);
 }
@@ -266,6 +322,145 @@ function stopSetupServer(): void {
     setupHttpServer.close();
     setupHttpServer = null;
   }
+}
+
+// ── Minimal WebSocket framing for phone relay ──────────────────────────
+// Implements just enough of RFC 6455 to send/receive text frames on a raw
+// net.Socket, avoiding a heavy dependency like `ws`. Only text frames and
+// close/ping/pong are handled — binary frames are ignored.
+
+function wsEncodeFrame(data: string): Buffer {
+  const payload = Buffer.from(data, 'utf-8');
+  const len = payload.length;
+  let header: Buffer;
+  if (len < 126) {
+    header = Buffer.alloc(2);
+    header[0] = 0x81; // FIN + text opcode
+    header[1] = len;
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x81;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  return Buffer.concat([header, payload]);
+}
+
+interface PhoneWsWrapper {
+  send(data: string): void;
+  close(): void;
+  readyState: number;
+}
+
+function setupPhoneWebSocket(socket: net.Socket, head: Buffer): void {
+  let buffer = Buffer.alloc(0);
+  if (head.length > 0) buffer = Buffer.from(head);
+
+  const wsWrapper: PhoneWsWrapper = {
+    readyState: 1, // OPEN
+    send(data: string) {
+      if (this.readyState !== 1) return;
+      try { socket.write(wsEncodeFrame(data)); } catch { /* socket may be dead */ }
+    },
+    close() {
+      this.readyState = 3; // CLOSED
+      try {
+        // Send close frame
+        const closeFrame = Buffer.alloc(2);
+        closeFrame[0] = 0x88; // FIN + close opcode
+        closeFrame[1] = 0;
+        socket.write(closeFrame);
+      } catch { /* ignore */ }
+      socket.destroy();
+    },
+  };
+
+  // Track this client as a connected phone
+  // We use a shim that matches the WebSocket interface enough for relayToPhoneClients
+  const clientShim = wsWrapper as unknown as WebSocket;
+  phoneWsClients.add(clientShim);
+  clientConnectedState = true;
+  lastClientHeartbeat = Date.now();
+  send('client-connected', true);
+
+  function cleanup() {
+    wsWrapper.readyState = 3;
+    phoneWsClients.delete(clientShim);
+    if (phoneWsClients.size === 0) {
+      clientConnectedState = false;
+      clientAwayState = false;
+      lastClientHeartbeat = 0;
+      send('client-disconnected', true);
+    }
+  }
+
+  socket.on('data', (chunk: Buffer) => {
+    buffer = Buffer.concat([buffer, chunk]);
+
+    // Process frames from buffer
+    while (buffer.length >= 2) {
+      const firstByte = buffer[0];
+      const secondByte = buffer[1];
+      const opcode = firstByte & 0x0f;
+      const masked = (secondByte & 0x80) !== 0;
+      let payloadLen = secondByte & 0x7f;
+      let offset = 2;
+
+      if (payloadLen === 126) {
+        if (buffer.length < 4) return;
+        payloadLen = buffer.readUInt16BE(2);
+        offset = 4;
+      } else if (payloadLen === 127) {
+        if (buffer.length < 10) return;
+        payloadLen = Number(buffer.readBigUInt64BE(2));
+        offset = 10;
+      }
+
+      const maskSize = masked ? 4 : 0;
+      const totalLen = offset + maskSize + payloadLen;
+      if (buffer.length < totalLen) return;
+
+      let payload = buffer.subarray(offset + maskSize, totalLen);
+      if (masked) {
+        const mask = buffer.subarray(offset, offset + maskSize);
+        payload = Buffer.from(payload); // copy so we can mutate
+        for (let i = 0; i < payload.length; i++) {
+          payload[i] ^= mask[i % 4];
+        }
+      }
+
+      buffer = buffer.subarray(totalLen);
+
+      // Handle by opcode
+      if (opcode === 0x01) {
+        // Text frame
+        const text = payload.toString('utf-8');
+        lastClientHeartbeat = Date.now();
+        handlePhoneWsMessage(clientShim as unknown as WebSocket, text);
+      } else if (opcode === 0x08) {
+        // Close frame
+        cleanup();
+        socket.destroy();
+        return;
+      } else if (opcode === 0x09) {
+        // Ping — respond with pong
+        const pong = Buffer.alloc(2 + payload.length);
+        pong[0] = 0x8a; // FIN + pong opcode
+        pong[1] = payload.length;
+        payload.copy(pong, 2);
+        try { socket.write(pong); } catch { /* ignore */ }
+      }
+      // opcode 0x0a = pong — ignore
+    }
+  });
+
+  socket.on('close', cleanup);
+  socket.on('error', cleanup);
 }
 
 // ── Reverse proxy (sits between cloudflared and OpenClaw/setup server) ──
@@ -505,8 +700,9 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
             } else if (typeof rawContent === 'string') {
               text = rawContent;
             }
-            if (text.trim()) {
-              messages.push({ role: entry.type, content: text });
+            const trimmed = text.replace(/^\n+|\n+$/g, '');
+            if (trimmed) {
+              messages.push({ role: entry.type, content: trimmed });
             }
           } catch { /* skip malformed lines */ }
         }
@@ -568,8 +764,49 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
     req.pipe(proxyReq, { end: true });
   });
 
-  // Handle WebSocket upgrades — proxy to OpenClaw gateway
+  // Handle WebSocket upgrades
   proxyServer.on('upgrade', (req, socket, head) => {
+    const reqUrl = new URL(req.url || '/', `http://127.0.0.1`);
+
+    // ── /ws/client — phone-facing WebSocket relay ──
+    if (reqUrl.pathname === '/ws/client') {
+      const wsToken = reqUrl.searchParams.get('token');
+      if (`Bearer ${wsToken}` !== expectedAuth) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+
+      // Perform WebSocket handshake manually
+      const key = req.headers['sec-websocket-key'];
+      if (!key) {
+        socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      const { createHash: wsHash } = require('node:crypto');
+      const acceptKey = wsHash('sha1')
+        .update(key + '258EAFA5-E914-47DA-95CA-5AB5DC085B63')
+        .digest('base64');
+
+      socket.write(
+        'HTTP/1.1 101 Switching Protocols\r\n' +
+        'Upgrade: websocket\r\n' +
+        'Connection: Upgrade\r\n' +
+        `Sec-WebSocket-Accept: ${acceptKey}\r\n` +
+        '\r\n'
+      );
+
+      // Use the native WebSocket-like wrapper over the raw socket
+      // Since we're in Node.js main process, use the global WebSocket via a
+      // lightweight framing layer on the raw net.Socket.
+      // Instead, create a WebSocket server instance for this one connection.
+      // The simplest approach: use a minimal WS framing helper.
+      setupPhoneWebSocket(socket, head);
+      return;
+    }
+
+    // ── Default: proxy WebSocket upgrades to OpenClaw gateway ──
     const proxySocket = net.createConnection(
       { host: '127.0.0.1', port: targetPort },
       () => {
@@ -757,61 +994,138 @@ function broadcastSessions(): void {
   send('sessions-updated', Array.from(sessions.values()));
 }
 
+let gatewayWsAuthenticated = false;
+
 function connectGatewayWs(port: number, token: string): void {
   closeGatewayWs();
-  // TODO(phase-2): implement the full gateway protocol handshake
-  // (connect challenge, device identity) so the WS session observer works.
-  // Without it, the gateway rejects connections with "handshake timeout".
-  // See https://docs.openclaw.ai/gateway/protocol
-  void port; void token;
-  return;
+  gatewayWsAuthenticated = false;
 
   const url = `ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`;
   const ws = new WebSocket(url);
   gatewayWs = ws;
 
+  let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
+
   ws.addEventListener('open', () => {
-    // Request current state if the gateway supports it
+    // Wait for connect.challenge from gateway — timeout after 10s
+    handshakeTimer = setTimeout(() => {
+      if (!gatewayWsAuthenticated) {
+        send('gateway-log', 'Gateway WS handshake timeout — retrying\n');
+        ws.close();
+      }
+    }, 10000);
   });
 
   ws.addEventListener('message', (evt) => {
     try {
       const msg = JSON.parse(String(evt.data));
-      if (!msg.type || !msg.session_id) return;
-      const sid: string = msg.session_id;
 
-      if (msg.type === 'session.status') {
+      // ── Handshake: respond to connect.challenge ──
+      if (msg.type === 'event' && msg.event === 'connect.challenge') {
+        send('gateway-log', `Gateway WS challenge received: ${JSON.stringify(msg)}\n`);
+        const { nonce, ts } = msg.payload || {};
+        if (!nonce) {
+          send('gateway-log', 'Gateway WS: challenge missing nonce\n');
+          ws.close();
+          return;
+        }
+        const connectReq = {
+          type: 'req',
+          id: 'connect-1',
+          method: 'connect',
+          params: {
+            minProtocol: 3,
+            maxProtocol: 3,
+            client: { id: 'openclaw-macos', version: '1.0.0', platform: 'darwin', mode: 'ui' },
+            role: 'operator',
+            scopes: ['operator.read', 'operator.write', 'operator.approvals'],
+            auth: { token },
+          },
+        };
+        send('gateway-log', `Gateway WS sending connect: ${JSON.stringify(connectReq)}\n`);
+        ws.send(JSON.stringify(connectReq));
+        return;
+      }
+
+      // ── Handshake: hello-ok response ──
+      if (msg.type === 'res' && msg.id === 'connect-1') {
+        if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = null; }
+        if (msg.ok) {
+          gatewayWsAuthenticated = true;
+          send('gateway-log', 'Connected to gateway WebSocket\n');
+        } else {
+          send('gateway-log', `Gateway WS handshake rejected: ${JSON.stringify(msg)}\n`);
+          ws.close();
+        }
+        return;
+      }
+
+      // Log any unhandled messages during handshake for debugging
+      if (!gatewayWsAuthenticated) {
+        send('gateway-log', `Gateway WS (pre-auth): ${JSON.stringify(msg)}\n`);
+      }
+
+      // ── Post-handshake: process gateway events ──
+      if (!gatewayWsAuthenticated) return;
+
+      // Gateway events come as { type: "event", event: "...", payload: { ... } }
+      // or flat { type: "...", session_id: "..." } depending on protocol version.
+      const eventType = msg.event || msg.type;
+      const payload = msg.payload || msg;
+      const sid: string = payload.session_id || payload.sessionId || '';
+
+      if (!sid && !['stream.delta', 'stream.end'].includes(eventType)) return;
+
+      if (eventType === 'session.status') {
         const existing = sessions.get(sid);
         sessions.set(sid, {
           id: sid,
-          status: msg.status === 'busy' ? 'busy' : 'idle',
-          title: existing?.title ?? msg.title ?? 'New session',
-          skill: msg.skill ?? existing?.skill,
+          status: payload.status === 'busy' ? 'busy' : 'idle',
+          title: existing?.title ?? payload.title ?? 'New session',
+          skill: payload.skill ?? existing?.skill,
           startedAt: existing?.startedAt ?? Date.now(),
         });
         broadcastSessions();
-      } else if (msg.type === 'session.idle') {
+        relayToPhoneClients(msg);
+      } else if (eventType === 'session.idle') {
         const existing = sessions.get(sid);
         if (existing) {
           existing.status = 'idle';
           broadcastSessions();
         }
-      } else if (msg.type === 'session.error') {
+        relayToPhoneClients(msg);
+      } else if (eventType === 'session.error') {
         const existing = sessions.get(sid);
         if (existing) {
           existing.status = 'idle';
-          existing.title = msg.error ? `Error: ${msg.error}` : existing.title;
+          existing.title = payload.error ? `Error: ${payload.error}` : existing.title;
           broadcastSessions();
         }
-      } else if (msg.type === 'message.updated') {
+        relayToPhoneClients(msg);
+      } else if (eventType === 'message.updated') {
         const existing = sessions.get(sid);
-        if (existing && msg.title) {
-          existing.title = msg.title;
+        if (existing && payload.title) {
+          existing.title = payload.title;
           broadcastSessions();
         }
-      } else if (msg.type === 'session.ended') {
+        relayToPhoneClients(msg);
+      } else if (eventType === 'session.ended') {
         sessions.delete(sid);
         broadcastSessions();
+        relayToPhoneClients(msg);
+      } else if (
+        eventType === 'stream.delta' ||
+        eventType === 'stream.end' ||
+        eventType === 'tool.start' ||
+        eventType === 'tool.result' ||
+        eventType === 'message.part.updated' ||
+        eventType === 'exec.approval.requested' ||
+        eventType === 'approval.requested' ||
+        eventType === 'exec.approval.resolved' ||
+        eventType === 'approval.resolved'
+      ) {
+        // Relay streaming + tool + approval events to connected phone clients
+        relayToPhoneClients(msg);
       }
     } catch {
       // Ignore non-JSON messages
@@ -819,7 +1133,9 @@ function connectGatewayWs(port: number, token: string): void {
   });
 
   ws.addEventListener('close', () => {
+    if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = null; }
     gatewayWs = null;
+    gatewayWsAuthenticated = false;
     if (!intentionallyStopping) {
       gatewayWsRetryTimer = setTimeout(() => connectGatewayWs(port, token), 3000);
     }
