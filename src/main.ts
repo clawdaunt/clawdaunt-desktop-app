@@ -659,7 +659,16 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
           return;
         }
         const sessionsData = JSON.parse(fs.readFileSync(sessionsPath, 'utf-8'));
-        const session = sessionsData[sessionKey];
+        // Look up by direct key first, then fall back to searching by sessionId
+        let session = sessionsData[sessionKey];
+        if (!session) {
+          for (const entry of Object.values(sessionsData) as Record<string, unknown>[]) {
+            if (entry.sessionId === sessionKey) {
+              session = entry;
+              break;
+            }
+          }
+        }
         if (!session || !session.claudeCliSessionId) {
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Session not found or no CLI session ID' }));
@@ -768,11 +777,54 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
           res.end(JSON.stringify({ error: stderr || err.message }));
           return;
         }
-        // Extract sessions array from response
+        // Extract sessions array and enrich with first user message
         try {
           const raw = JSON.parse(stdout);
-          const sessions = Array.isArray(raw) ? raw : (raw.sessions || []);
+          const sessions: Record<string, unknown>[] = Array.isArray(raw) ? raw : (raw.sessions || []);
           const activeWs = config.workspaces.find((w) => w.id === config.activeWorkspaceId);
+
+          // Read sessions.json to map keys → claudeCliSessionId
+          const sessionsPath = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'sessions', 'sessions.json');
+          let sessionsData: Record<string, { claudeCliSessionId?: string }> = {};
+          try { sessionsData = JSON.parse(fs.readFileSync(sessionsPath, 'utf-8')); } catch { /* ignore */ }
+
+          const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+          const projectDirs = fs.existsSync(claudeProjectsDir) ? fs.readdirSync(claudeProjectsDir) : [];
+
+          for (const s of sessions) {
+            const fullKey = (s.key || '') as string;
+            const shortKey = fullKey.includes(':') ? fullKey.split(':').pop()! : fullKey;
+            const entry = sessionsData[shortKey] || sessionsData[fullKey];
+            if (!entry?.claudeCliSessionId) continue;
+            // Find JSONL and extract first user message
+            for (const dir of projectDirs) {
+              const candidate = path.join(claudeProjectsDir, dir, `${entry.claudeCliSessionId}.jsonl`);
+              if (!fs.existsSync(candidate)) continue;
+              try {
+                const content = fs.readFileSync(candidate, 'utf-8');
+                // Read only enough lines to find first user message
+                for (const line of content.split('\n')) {
+                  if (!line) continue;
+                  const parsed = JSON.parse(line);
+                  if (parsed.type !== 'user') continue;
+                  const rawContent = parsed.message?.content ?? '';
+                  let text = '';
+                  if (Array.isArray(rawContent)) {
+                    text = rawContent.filter((c: { type: string }) => c.type === 'text').map((c: { text: string }) => c.text).join('');
+                  } else if (typeof rawContent === 'string') {
+                    text = rawContent;
+                  }
+                  const trimmed = text.replace(/^\n+|\n+$/g, '');
+                  if (trimmed) {
+                    s.firstMessage = trimmed.length > 100 ? trimmed.slice(0, 100) + '...' : trimmed;
+                  }
+                  break;
+                }
+              } catch { /* skip */ }
+              break;
+            }
+          }
+
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             sessions,
