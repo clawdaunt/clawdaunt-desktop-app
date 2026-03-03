@@ -772,8 +772,12 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
         try {
           const raw = JSON.parse(stdout);
           const sessions = Array.isArray(raw) ? raw : (raw.sessions || []);
+          const activeWs = config.workspaces.find((w) => w.id === config.activeWorkspaceId);
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(sessions));
+          res.end(JSON.stringify({
+            sessions,
+            activeWorkspaceName: activeWs?.name || null,
+          }));
         } catch {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(stdout);
