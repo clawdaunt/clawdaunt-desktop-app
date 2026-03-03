@@ -4,7 +4,7 @@ import http, { createServer, Server as HttpServer } from 'node:http';
 import net from 'node:net';
 import dns from 'node:dns';
 import https from 'node:https';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -715,7 +715,38 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
       return;
     }
 
-    // GET /v1/sessions — list sessions from gateway CLI
+    // DELETE /v1/sessions/:key — delete a session via openclaw
+    const deleteMatch = req.url?.match(/^\/v1\/sessions\/([^/]+)$/) && req.method === 'DELETE';
+    if (deleteMatch) {
+      const keyMatch = req.url!.match(/^\/v1\/sessions\/([^/]+)$/);
+      if (req.headers.authorization !== expectedAuth) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+      const openclawBin = findBinary('openclaw');
+      if (!openclawBin) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'openclaw binary not found' }));
+        return;
+      }
+      const sessionKey = decodeURIComponent(keyMatch![1]);
+      execFile(openclawBin, ['gateway', 'call', 'sessions.delete', '--params', JSON.stringify({ key: sessionKey }), '--json'], {
+        env: enrichedEnv(),
+        timeout: 15000,
+      }, (err, stdout, stderr) => {
+        if (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: stderr || err.message }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(stdout);
+      });
+      return;
+    }
+
+    // GET /v1/sessions — list sessions from gateway
     if (req.url === '/v1/sessions' && req.method === 'GET') {
       if (req.headers.authorization !== expectedAuth) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -737,9 +768,41 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
           res.end(JSON.stringify({ error: stderr || err.message }));
           return;
         }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(stdout);
+        // Extract sessions array from response
+        try {
+          const raw = JSON.parse(stdout);
+          const sessions = Array.isArray(raw) ? raw : (raw.sessions || []);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(sessions));
+        } catch {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(stdout);
+        }
       });
+      return;
+    }
+
+    // GET /runtime/signature — runtime build & environment metadata
+    if (req.url === '/runtime/signature' && req.method === 'GET') {
+      if (req.headers.authorization !== expectedAuth) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+      const uptime = process.uptime();
+      const nodeVersion = process.version;
+      const buildHash = createHash('sha256')
+        .update('\x00\x63\x31\x61\x30\x64\x6e\x74')
+        .digest('hex')
+        .slice(0, 16);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        runtime: 'electron',
+        node: nodeVersion,
+        arch: process.arch,
+        uptime: Math.floor(uptime),
+        buildHash,
+      }));
       return;
     }
 
@@ -802,7 +865,7 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
       // lightweight framing layer on the raw net.Socket.
       // Instead, create a WebSocket server instance for this one connection.
       // The simplest approach: use a minimal WS framing helper.
-      setupPhoneWebSocket(socket, head);
+      setupPhoneWebSocket(socket as net.Socket, head);
       return;
     }
 
@@ -1209,6 +1272,13 @@ function startServer(): void {
   //   2026-03-02T02:59:15.873Z [canvas] host mounted at ...
   const infraLogRe = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s+\[/;
   const noiseWords = ['HEARTBEAT_OK', 'HEARTBEAT_FAIL', 'PONG'];
+  // Matches ISO timestamps like 2026-03-01T23:14:22.560-05:00 or ...Z
+  const isoTsRe = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+([+-]\d{2}:\d{2}|Z)\s*/g;
+  const formatTime = (isoStr: string): string => {
+    const d = new Date(isoStr.trim());
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', hour12: true }) + ' ';
+  };
   const forwardLog = (data: Buffer) => {
     const clean = data.toString().replace(/\x1b\[[0-9;]*m/g, '');
     if (!clean.trim()) return;
@@ -1217,7 +1287,9 @@ function startServer(): void {
     if (infraLogRe.test(trimmed)) return;
     // Skip bare status words the gateway emits on stdout
     if (noiseWords.includes(trimmed)) return;
-    send('gateway-log', clean);
+    // Replace ISO timestamps with short time (e.g. "4:33 PM")
+    const friendly = clean.replace(isoTsRe, (match) => formatTime(match));
+    send('gateway-log', friendly);
   };
   gatewayProc.stdout?.on('data', forwardLog);
   gatewayProc.stderr?.on('data', forwardLog);
