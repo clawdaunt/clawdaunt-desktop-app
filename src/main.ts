@@ -279,7 +279,9 @@ function handlePhoneWsMessage(ws: WebSocket, raw: string): void {
 }
 
 function send(channel: string, data: unknown) {
-  mainWindow?.webContents.send(channel, data);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, data);
+  }
 }
 
 // ── Setup server (serves health check before OpenClaw gateway starts) ──
@@ -1446,7 +1448,7 @@ ipcMain.handle('config:set-ai-source', (_, aiSource: AISource, apiKey?: string, 
 });
 
 ipcMain.handle('workspace:create', async () => {
-  if (!mainWindow) return loadConfig();
+  if (!mainWindow || mainWindow.isDestroyed()) return loadConfig();
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory'],
     message: 'Select a project folder for the new workspace',
@@ -1522,7 +1524,7 @@ ipcMain.handle('workspace:set-active', (_, id: string) => {
 });
 
 ipcMain.handle('workspace:add-protected', async (_, workspaceId: string) => {
-  if (!mainWindow) return loadConfig();
+  if (!mainWindow || mainWindow.isDestroyed()) return loadConfig();
   const config = loadConfig();
   const ws = config.workspaces.find((w) => w.id === workspaceId);
   if (!ws) return config;
@@ -1564,6 +1566,10 @@ const createWindow = () => {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
     },
+  });
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
   });
 
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {

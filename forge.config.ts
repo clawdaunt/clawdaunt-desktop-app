@@ -14,6 +14,7 @@ const config: ForgeConfig = {
     asar: true,
     name: 'Clawdaunt',
     executableName: 'Clawdaunt',
+    icon: 'resources/icon',
     extraResource: ['resources/bin'],
     osxSign: {
       identity: process.env.APPLE_SIGNING_IDENTITY!,

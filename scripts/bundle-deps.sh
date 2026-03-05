@@ -73,9 +73,28 @@ else
   fi
 
   if [ -n "$OPENCLAW_PATH" ]; then
-    echo "[cp] Copying openclaw from $OPENCLAW_PATH"
-    cp "$OPENCLAW_PATH" "$BIN_DIR/openclaw"
+    # Resolve symlinks to find the real installation
+    REAL_PATH="$(readlink -f "$OPENCLAW_PATH" 2>/dev/null || realpath "$OPENCLAW_PATH" 2>/dev/null || echo "$OPENCLAW_PATH")"
+    OPENCLAW_DIR="$(dirname "$REAL_PATH")"
+
+    echo "[cp] Copying openclaw from $REAL_PATH"
+    cp "$REAL_PATH" "$BIN_DIR/openclaw"
     chmod +x "$BIN_DIR/openclaw"
+
+    # Copy the dist/ directory (built output required by the launcher)
+    if [ -d "$OPENCLAW_DIR/dist" ]; then
+      echo "[cp] Copying openclaw dist/ from $OPENCLAW_DIR/dist"
+      cp -R "$OPENCLAW_DIR/dist" "$BIN_DIR/dist"
+    elif [ -d "$OPENCLAW_DIR/../lib/node_modules/openclaw/dist" ]; then
+      # Homebrew layout: libexec/bin/openclaw -> libexec/lib/node_modules/openclaw/dist
+      DIST_DIR="$(cd "$OPENCLAW_DIR/../lib/node_modules/openclaw/dist" && pwd)"
+      echo "[cp] Copying openclaw dist/ from $DIST_DIR"
+      cp -R "$DIST_DIR" "$BIN_DIR/dist"
+    else
+      echo "[!!] Warning: openclaw dist/ not found — the bundled binary may not work."
+      echo "     Expected dist/ next to or relative to: $REAL_PATH"
+    fi
+
     echo "[ok] openclaw bundled"
   else
     echo "[!!] openclaw not found and could not be installed."
