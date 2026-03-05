@@ -195,10 +195,18 @@ function findBinary(name: string): string | null {
   return null;
 }
 
+/** Returns the bundled node binary, or falls back to system node. */
+function findNode(): string {
+  const bundled = path.join(bundledBinDir(), 'node');
+  if (fs.existsSync(bundled)) return bundled;
+  return 'node';
+}
+
 function enrichedEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
     ...process.env,
     PATH: SEARCH_PATHS.join(':'),
+    NODE_PATH: path.join(bundledBinDir(), 'node_modules'),
     ...extra,
   };
 }
@@ -742,7 +750,7 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
         return;
       }
       const sessionKey = decodeURIComponent(keyMatch![1]);
-      execFile(openclawBin, ['gateway', 'call', 'sessions.delete', '--params', JSON.stringify({ key: sessionKey }), '--json'], {
+      execFile(findNode(), [openclawBin, 'gateway', 'call', 'sessions.delete', '--params', JSON.stringify({ key: sessionKey }), '--json'], {
         env: enrichedEnv(),
         timeout: 15000,
       }, (err, stdout, stderr) => {
@@ -770,7 +778,7 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
         res.end(JSON.stringify({ error: 'openclaw binary not found' }));
         return;
       }
-      execFile(openclawBin, ['gateway', 'call', 'sessions.list', '--json'], {
+      execFile(findNode(), [openclawBin, 'gateway', 'call', 'sessions.list', '--json'], {
         env: enrichedEnv(),
         timeout: 15000,
       }, (err, stdout, stderr) => {
@@ -1313,7 +1321,8 @@ function startServer(): void {
     }
   }
 
-  gatewayProc = spawn(openclawBin, [
+  gatewayProc = spawn(findNode(), [
+    openclawBin,
     'gateway',
     '--port', String(config.port),
     '--token', config.password,
@@ -1622,5 +1631,5 @@ app.on('before-quit', () => {
 });
 
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  if (app.isReady() && BrowserWindow.getAllWindows().length === 0) createWindow();
 });
