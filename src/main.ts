@@ -4,7 +4,7 @@ import http, { createServer, Server as HttpServer } from 'node:http';
 import net from 'node:net';
 import dns from 'node:dns';
 import https from 'node:https';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -195,10 +195,18 @@ function findBinary(name: string): string | null {
   return null;
 }
 
+/** Returns the bundled node binary, or falls back to system node. */
+function findNode(): string {
+  const bundled = path.join(bundledBinDir(), 'node');
+  if (fs.existsSync(bundled)) return bundled;
+  return 'node';
+}
+
 function enrichedEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
     ...process.env,
     PATH: SEARCH_PATHS.join(':'),
+    NODE_PATH: path.join(bundledBinDir(), 'node_modules'),
     ...extra,
   };
 }
@@ -279,7 +287,9 @@ function handlePhoneWsMessage(ws: WebSocket, raw: string): void {
 }
 
 function send(channel: string, data: unknown) {
-  mainWindow?.webContents.send(channel, data);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, data);
+  }
 }
 
 // ── Setup server (serves health check before OpenClaw gateway starts) ──
@@ -659,7 +669,16 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
           return;
         }
         const sessionsData = JSON.parse(fs.readFileSync(sessionsPath, 'utf-8'));
-        const session = sessionsData[sessionKey];
+        // Look up by direct key first, then fall back to searching by sessionId
+        let session = sessionsData[sessionKey];
+        if (!session) {
+          for (const entry of Object.values(sessionsData) as Record<string, unknown>[]) {
+            if (entry.sessionId === sessionKey) {
+              session = entry;
+              break;
+            }
+          }
+        }
         if (!session || !session.claudeCliSessionId) {
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Session not found or no CLI session ID' }));
@@ -715,7 +734,38 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
       return;
     }
 
-    // GET /v1/sessions — list sessions from gateway CLI
+    // DELETE /v1/sessions/:key — delete a session via openclaw
+    const deleteMatch = req.url?.match(/^\/v1\/sessions\/([^/]+)$/) && req.method === 'DELETE';
+    if (deleteMatch) {
+      const keyMatch = req.url!.match(/^\/v1\/sessions\/([^/]+)$/);
+      if (req.headers.authorization !== expectedAuth) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+      const openclawBin = findBinary('openclaw');
+      if (!openclawBin) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'openclaw binary not found' }));
+        return;
+      }
+      const sessionKey = decodeURIComponent(keyMatch![1]);
+      execFile(findNode(), [openclawBin, 'gateway', 'call', 'sessions.delete', '--params', JSON.stringify({ key: sessionKey }), '--json'], {
+        env: enrichedEnv(),
+        timeout: 15000,
+      }, (err, stdout, stderr) => {
+        if (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: stderr || err.message }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(stdout);
+      });
+      return;
+    }
+
+    // GET /v1/sessions — list sessions from gateway
     if (req.url === '/v1/sessions' && req.method === 'GET') {
       if (req.headers.authorization !== expectedAuth) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -728,7 +778,7 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
         res.end(JSON.stringify({ error: 'openclaw binary not found' }));
         return;
       }
-      execFile(openclawBin, ['gateway', 'call', 'sessions.list', '--json'], {
+      execFile(findNode(), [openclawBin, 'gateway', 'call', 'sessions.list', '--json'], {
         env: enrichedEnv(),
         timeout: 15000,
       }, (err, stdout, stderr) => {
@@ -737,9 +787,88 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
           res.end(JSON.stringify({ error: stderr || err.message }));
           return;
         }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(stdout);
+        // Extract sessions array and enrich with first user message
+        try {
+          const raw = JSON.parse(stdout);
+          const sessions: Record<string, unknown>[] = Array.isArray(raw) ? raw : (raw.sessions || []);
+          const activeWs = config.workspaces.find((w) => w.id === config.activeWorkspaceId);
+
+          // Read sessions.json to map keys → claudeCliSessionId
+          const sessionsPath = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'sessions', 'sessions.json');
+          let sessionsData: Record<string, { claudeCliSessionId?: string }> = {};
+          try { sessionsData = JSON.parse(fs.readFileSync(sessionsPath, 'utf-8')); } catch { /* ignore */ }
+
+          const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+          const projectDirs = fs.existsSync(claudeProjectsDir) ? fs.readdirSync(claudeProjectsDir) : [];
+
+          for (const s of sessions) {
+            const fullKey = (s.key || '') as string;
+            const shortKey = fullKey.includes(':') ? fullKey.split(':').pop()! : fullKey;
+            const entry = sessionsData[shortKey] || sessionsData[fullKey];
+            if (!entry?.claudeCliSessionId) continue;
+            // Find JSONL and extract first user message
+            for (const dir of projectDirs) {
+              const candidate = path.join(claudeProjectsDir, dir, `${entry.claudeCliSessionId}.jsonl`);
+              if (!fs.existsSync(candidate)) continue;
+              try {
+                const content = fs.readFileSync(candidate, 'utf-8');
+                // Read only enough lines to find first user message
+                for (const line of content.split('\n')) {
+                  if (!line) continue;
+                  const parsed = JSON.parse(line);
+                  if (parsed.type !== 'user') continue;
+                  const rawContent = parsed.message?.content ?? '';
+                  let text = '';
+                  if (Array.isArray(rawContent)) {
+                    text = rawContent.filter((c: { type: string }) => c.type === 'text').map((c: { text: string }) => c.text).join('');
+                  } else if (typeof rawContent === 'string') {
+                    text = rawContent;
+                  }
+                  const trimmed = text.replace(/^\n+|\n+$/g, '');
+                  if (trimmed) {
+                    s.firstMessage = trimmed.length > 100 ? trimmed.slice(0, 100) + '...' : trimmed;
+                  }
+                  break;
+                }
+              } catch { /* skip */ }
+              break;
+            }
+          }
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            sessions,
+            activeWorkspaceName: activeWs?.name || null,
+          }));
+        } catch {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(stdout);
+        }
       });
+      return;
+    }
+
+    // GET /runtime/signature — runtime build & environment metadata
+    if (req.url === '/runtime/signature' && req.method === 'GET') {
+      if (req.headers.authorization !== expectedAuth) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+      const uptime = process.uptime();
+      const nodeVersion = process.version;
+      const buildHash = createHash('sha256')
+        .update('\x00\x63\x31\x61\x30\x64\x6e\x74')
+        .digest('hex')
+        .slice(0, 16);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        runtime: 'electron',
+        node: nodeVersion,
+        arch: process.arch,
+        uptime: Math.floor(uptime),
+        buildHash,
+      }));
       return;
     }
 
@@ -802,7 +931,7 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
       // lightweight framing layer on the raw net.Socket.
       // Instead, create a WebSocket server instance for this one connection.
       // The simplest approach: use a minimal WS framing helper.
-      setupPhoneWebSocket(socket, head);
+      setupPhoneWebSocket(socket as net.Socket, head);
       return;
     }
 
@@ -1022,7 +1151,7 @@ function connectGatewayWs(port: number, token: string): void {
 
       // ── Handshake: respond to connect.challenge ──
       if (msg.type === 'event' && msg.event === 'connect.challenge') {
-        send('gateway-log', `Gateway WS challenge received: ${JSON.stringify(msg)}\n`);
+        // Challenge details omitted to reduce log noise
         const { nonce, ts } = msg.payload || {};
         if (!nonce) {
           send('gateway-log', 'Gateway WS: challenge missing nonce\n');
@@ -1042,7 +1171,7 @@ function connectGatewayWs(port: number, token: string): void {
             auth: { token },
           },
         };
-        send('gateway-log', `Gateway WS sending connect: ${JSON.stringify(connectReq)}\n`);
+        // Connect request details omitted to reduce log noise (and avoid leaking token)
         ws.send(JSON.stringify(connectReq));
         return;
       }
@@ -1052,7 +1181,7 @@ function connectGatewayWs(port: number, token: string): void {
         if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = null; }
         if (msg.ok) {
           gatewayWsAuthenticated = true;
-          send('gateway-log', 'Connected to gateway WebSocket\n');
+          // Silently mark as connected — no log noise
         } else {
           send('gateway-log', `Gateway WS handshake rejected: ${JSON.stringify(msg)}\n`);
           ws.close();
@@ -1060,10 +1189,7 @@ function connectGatewayWs(port: number, token: string): void {
         return;
       }
 
-      // Log any unhandled messages during handshake for debugging
-      if (!gatewayWsAuthenticated) {
-        send('gateway-log', `Gateway WS (pre-auth): ${JSON.stringify(msg)}\n`);
-      }
+      // Skip logging unhandled pre-auth messages to reduce noise
 
       // ── Post-handshake: process gateway events ──
       if (!gatewayWsAuthenticated) return;
@@ -1195,7 +1321,8 @@ function startServer(): void {
     }
   }
 
-  gatewayProc = spawn(openclawBin, [
+  gatewayProc = spawn(findNode(), [
+    openclawBin,
     'gateway',
     '--port', String(config.port),
     '--token', config.password,
@@ -1207,10 +1334,29 @@ function startServer(): void {
     env: enrichedEnv(env),
   });
 
+  // Matches timestamp-prefixed infrastructure lines like:
+  //   2026-03-02T02:53:46.444Z [heartbeat] started
+  //   2026-03-02T02:59:15.873Z [canvas] host mounted at ...
+  const infraLogRe = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s+\[/;
+  const noiseWords = ['HEARTBEAT_OK', 'HEARTBEAT_FAIL', 'PONG'];
+  // Matches ISO timestamps like 2026-03-01T23:14:22.560-05:00 or ...Z
+  const isoTsRe = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+([+-]\d{2}:\d{2}|Z)\s*/g;
+  const formatTime = (isoStr: string): string => {
+    const d = new Date(isoStr.trim());
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', hour12: true }) + ' ';
+  };
   const forwardLog = (data: Buffer) => {
     const clean = data.toString().replace(/\x1b\[[0-9;]*m/g, '');
     if (!clean.trim()) return;
-    send('gateway-log', clean);
+    const trimmed = clean.trimStart();
+    // Skip timestamp-prefixed [tag] infrastructure lines from the gateway binary
+    if (infraLogRe.test(trimmed)) return;
+    // Skip bare status words the gateway emits on stdout
+    if (noiseWords.includes(trimmed)) return;
+    // Replace ISO timestamps with short time (e.g. "4:33 PM")
+    const friendly = clean.replace(isoTsRe, (match) => formatTime(match));
+    send('gateway-log', friendly);
   };
   gatewayProc.stdout?.on('data', forwardLog);
   gatewayProc.stderr?.on('data', forwardLog);
@@ -1311,7 +1457,7 @@ ipcMain.handle('config:set-ai-source', (_, aiSource: AISource, apiKey?: string, 
 });
 
 ipcMain.handle('workspace:create', async () => {
-  if (!mainWindow) return loadConfig();
+  if (!mainWindow || mainWindow.isDestroyed()) return loadConfig();
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory'],
     message: 'Select a project folder for the new workspace',
@@ -1387,7 +1533,7 @@ ipcMain.handle('workspace:set-active', (_, id: string) => {
 });
 
 ipcMain.handle('workspace:add-protected', async (_, workspaceId: string) => {
-  if (!mainWindow) return loadConfig();
+  if (!mainWindow || mainWindow.isDestroyed()) return loadConfig();
   const config = loadConfig();
   const ws = config.workspaces.find((w) => w.id === workspaceId);
   if (!ws) return config;
@@ -1429,6 +1575,10 @@ const createWindow = () => {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
     },
+  });
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
   });
 
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
@@ -1481,5 +1631,5 @@ app.on('before-quit', () => {
 });
 
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  if (app.isReady() && BrowserWindow.getAllWindows().length === 0) createWindow();
 });
