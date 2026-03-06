@@ -15,31 +15,33 @@ export default function QRModal({ open, onClose, tunnelURL, qrPayload, errorMsg 
   const isRateLimited = errorMsg.toLowerCase().includes('rate limit');
 
   return (
-    <div className="qr-modal-backdrop" onClick={onClose}>
-      <div className="qr-modal" onClick={(e) => e.stopPropagation()}>
-        <button className="qr-modal-close" onClick={onClose}>×</button>
-        <h2 className="qr-modal-title">Scan QR code with app</h2>
-        <div className="qr-container">
-          {!tunnelURL ? (
-            isRateLimited ? (
-              <div className="qr-placeholder">
-                <p className="tunnel-error-msg">Cloudflare rate limit hit</p>
-                <p className="tunnel-error-hint">
-                  Too many tunnel requests. Please wait a few minutes and retry.
-                </p>
-              </div>
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <button className="modal-close" onClick={onClose}>×</button>
+        <h2 className="modal-title">Connect your device</h2>
+        <div className="qr-modal-content">
+          <div className="qr-container">
+            {!tunnelURL ? (
+              isRateLimited ? (
+                <div className="qr-placeholder">
+                  <p className="qr-error-title">Rate limit reached</p>
+                  <p className="qr-error-hint">
+                    Too many tunnel requests. Please wait a few minutes and try again.
+                  </p>
+                </div>
+              ) : (
+                <div className="qr-placeholder">
+                  <div className="spinner" />
+                  <p>Setting up connection...</p>
+                </div>
+              )
             ) : (
-              <div className="qr-placeholder">
-                <div className="spinner" />
-                <p>Setting up tunnel...</p>
-              </div>
-            )
-          ) : (
-            <QRCodeSVG value={qrPayload} size={192} level="M" />
-          )}
+              <QRCodeSVG value={qrPayload} size={192} level="M" />
+            )}
+          </div>
+          {tunnelURL && <p className="qr-hint">Scan with the Clawdaunt app to connect</p>}
+          {errorMsg && !isRateLimited && <div className="error-banner">{errorMsg}</div>}
         </div>
-        {tunnelURL && <p className="scan-hint">Scan with clawdaunt app to connect</p>}
-        {errorMsg && !isRateLimited && <p className="error-msg">{errorMsg}</p>}
       </div>
     </div>
   );

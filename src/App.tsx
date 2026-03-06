@@ -73,11 +73,9 @@ export default function App() {
 
   if (!config) {
     return (
-      <div className="console">
+      <div className="loading-screen">
         <div className="drag-region" />
-        <div className="empty-panel">
-          <div className="spinner" />
-        </div>
+        <div className="spinner" />
       </div>
     );
   }

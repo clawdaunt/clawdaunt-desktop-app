@@ -182,15 +182,28 @@ function bundledBinDir(): string {
   return path.join(process.resourcesPath, 'bin');
 }
 
-function findBinary(name: string): string | null {
-  // 1. Bundled in app resources
-  const bundled = path.join(bundledBinDir(), name);
-  if (fs.existsSync(bundled)) return bundled;
+// CLIs where user-installed version should take precedence over bundled,
+// to avoid version/config conflicts.
+const PREFER_SYSTEM = new Set(['openclaw', 'claude', 'codex']);
 
-  // 2. User's shell PATH + fallback paths
-  for (const dir of SEARCH_PATHS) {
-    const full = path.join(dir, name);
-    if (fs.existsSync(full)) return full;
+function findBinary(name: string): string | null {
+  if (PREFER_SYSTEM.has(name)) {
+    // 1. User's shell PATH + fallback paths first
+    for (const dir of SEARCH_PATHS) {
+      const full = path.join(dir, name);
+      if (fs.existsSync(full)) return full;
+    }
+    // 2. Fall back to bundled
+    const bundled = path.join(bundledBinDir(), name);
+    if (fs.existsSync(bundled)) return bundled;
+  } else {
+    // Infrastructure binaries (node, cloudflared): prefer bundled for stability
+    const bundled = path.join(bundledBinDir(), name);
+    if (fs.existsSync(bundled)) return bundled;
+    for (const dir of SEARCH_PATHS) {
+      const full = path.join(dir, name);
+      if (fs.existsSync(full)) return full;
+    }
   }
   return null;
 }
@@ -229,7 +242,7 @@ let clientAwayState = false;
 let caffeinateProc: ChildProcess | null = null;
 let gatewayWs: WebSocket | null = null;
 let gatewayWsRetryTimer: ReturnType<typeof setTimeout> | null = null;
-const sessions = new Map<string, { id: string; status: 'busy' | 'idle'; title: string; skill?: string; startedAt: number }>();
+const sessions = new Map<string, { id: string; status: 'busy' | 'idle'; title: string; skill?: string; startedAt: number; workspaceId?: string }>();
 
 // ── Phone WebSocket clients (connected via /ws/client) ──────────────────
 const phoneWsClients = new Set<WebSocket>();
@@ -1210,6 +1223,7 @@ function connectGatewayWs(port: number, token: string): void {
           title: existing?.title ?? payload.title ?? 'New session',
           skill: payload.skill ?? existing?.skill,
           startedAt: existing?.startedAt ?? Date.now(),
+          workspaceId: existing?.workspaceId ?? config.activeWorkspaceId ?? undefined,
         });
         broadcastSessions();
         relayToPhoneClients(msg);

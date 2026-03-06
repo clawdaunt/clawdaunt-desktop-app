@@ -26,6 +26,7 @@ interface GatewaySession {
   title: string;
   skill?: string;
   startedAt: number;
+  workspaceId?: string;
 }
 
 interface CLIStatus {
