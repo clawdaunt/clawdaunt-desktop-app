@@ -140,14 +140,19 @@ function generateOpenClawConfig(config: Config): void {
   } else if (config.aiSource === 'api-key') {
     primary = config.apiProvider === 'openai'
       ? 'openai/gpt-4o'
-      : 'anthropic/claude-sonnet-4-20250514';
+      : config.apiProvider === 'minimax'
+        ? 'minimax/MiniMax-M2.5'
+        : 'anthropic/claude-sonnet-4-20250514';
   } else {
     primary = 'claude-cli/opus-4.6';
   }
 
+  const activeWs = config.workspaces.find((w) => w.id === config.activeWorkspaceId);
+
   openclawConfig.agents = {
     defaults: {
       model: { primary },
+      ...(activeWs ? { workspace: activeWs.paths[0] } : {}),
       ...(Object.keys(cliBackends).length > 0 ? { cliBackends } : {}),
     },
   };
@@ -558,7 +563,7 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
       }
       let body = '';
       req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
-      req.on('end', () => {
+      req.on('end', async () => {
         try {
           const { aiSource, apiKey, apiProvider } = JSON.parse(body);
           if (!aiSource || !['claude-cli', 'codex-cli', 'api-key'].includes(aiSource)) {
@@ -572,7 +577,7 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
           if (apiProvider !== undefined) cfg.apiProvider = apiProvider;
           saveConfig(cfg);
           // Restart server with new config (same logic as IPC config:set-ai-source)
-          stopServer(false);
+          await stopServer(false);
           generateOpenClawConfig(cfg);
           startServer();
           // Notify desktop UI of config change
@@ -622,7 +627,7 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
       return;
     }
 
-    // POST /global/workspaces/active — set active workspace, restart gateway
+    // POST /global/workspaces/active — set active workspace via config hot-reload
     if (req.url === '/global/workspaces/active' && req.method === 'POST') {
       if (req.headers.authorization !== expectedAuth) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -643,8 +648,8 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
           }
           cfg.activeWorkspaceId = workspaceId;
           saveConfig(cfg);
-          stopServer(false);
-          startServer();
+          // Rewrite openclaw.json — gateway file watcher will hot-reload the workspace
+          generateOpenClawConfig(cfg);
           send('config-changed', cfg);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
@@ -1223,10 +1228,11 @@ function connectGatewayWs(port: number, token: string): void {
           title: existing?.title ?? payload.title ?? 'New session',
           skill: payload.skill ?? existing?.skill,
           startedAt: existing?.startedAt ?? Date.now(),
-          workspaceId: existing?.workspaceId ?? config.activeWorkspaceId ?? undefined,
+          workspaceId: existing?.workspaceId ?? loadConfig().activeWorkspaceId ?? undefined,
         });
         broadcastSessions();
         relayToPhoneClients(msg);
+        send('chat-event', { type: eventType, payload });
       } else if (eventType === 'session.idle') {
         const existing = sessions.get(sid);
         if (existing) {
@@ -1234,6 +1240,7 @@ function connectGatewayWs(port: number, token: string): void {
           broadcastSessions();
         }
         relayToPhoneClients(msg);
+        send('chat-event', { type: eventType, payload });
       } else if (eventType === 'session.error') {
         const existing = sessions.get(sid);
         if (existing) {
@@ -1242,6 +1249,7 @@ function connectGatewayWs(port: number, token: string): void {
           broadcastSessions();
         }
         relayToPhoneClients(msg);
+        send('chat-event', { type: eventType, payload });
       } else if (eventType === 'message.updated') {
         const existing = sessions.get(sid);
         if (existing && payload.title) {
@@ -1253,6 +1261,7 @@ function connectGatewayWs(port: number, token: string): void {
         sessions.delete(sid);
         broadcastSessions();
         relayToPhoneClients(msg);
+        send('chat-event', { type: eventType, payload });
       } else if (
         eventType === 'stream.delta' ||
         eventType === 'stream.end' ||
@@ -1264,8 +1273,8 @@ function connectGatewayWs(port: number, token: string): void {
         eventType === 'exec.approval.resolved' ||
         eventType === 'approval.resolved'
       ) {
-        // Relay streaming + tool + approval events to connected phone clients
         relayToPhoneClients(msg);
+        send('chat-event', { type: eventType, payload });
       }
     } catch {
       // Ignore non-JSON messages
@@ -1332,6 +1341,8 @@ function startServer(): void {
       env.ANTHROPIC_API_KEY = config.apiKey;
     } else if (config.apiProvider === 'openai') {
       env.OPENAI_API_KEY = config.apiKey;
+    } else if (config.apiProvider === 'minimax') {
+      env.MINIMAX_API_KEY = config.apiKey;
     }
   }
 
@@ -1344,7 +1355,6 @@ function startServer(): void {
     '--force',
     '--compact',
   ], {
-    cwd: activeWs.paths[0],
     env: enrichedEnv(env),
   });
 
@@ -1401,10 +1411,10 @@ function startServer(): void {
   }, 2000);
 }
 
-function stopServer(resetClient = true): void {
+function stopServer(resetClient = true): Promise<void> {
   intentionallyStopping = true;
   closeGatewayWs();
-  gatewayProc?.kill();
+  const proc = gatewayProc;
   gatewayProc = null;
   send('status', 'stopped');
   if (resetClient) {
@@ -1414,6 +1424,13 @@ function stopServer(resetClient = true): void {
     stopClientPresenceMonitor();
     send('client-disconnected', true);
   }
+  if (!proc || proc.killed) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    proc.on('exit', () => resolve());
+    proc.kill();
+    // Fallback in case exit event never fires
+    setTimeout(resolve, 3000);
+  });
 }
 
 function stopAll(): void {
@@ -1446,13 +1463,42 @@ ipcMain.handle('server:stop', () => stopServer());
 
 ipcMain.handle('sessions:list', () => Array.from(sessions.values()));
 
+ipcMain.handle('chat:send', (_, sessionKey: string, message: string) => {
+  if (!gatewayWs || gatewayWs.readyState !== WebSocket.OPEN || !gatewayWsAuthenticated) {
+    send('chat-event', { type: 'error', payload: { error: 'Gateway not connected' } });
+    return;
+  }
+  const reqId = `chat-${Date.now()}`;
+  gatewayWs.send(JSON.stringify({
+    type: 'req',
+    id: reqId,
+    method: 'chat.send',
+    params: {
+      sessionKey,
+      messages: [{ role: 'user', content: message }],
+      model: 'default',
+      stream: true,
+    },
+  }));
+});
+
+ipcMain.handle('chat:abort', (_, sessionKey: string) => {
+  if (!gatewayWs || gatewayWs.readyState !== WebSocket.OPEN || !gatewayWsAuthenticated) return;
+  gatewayWs.send(JSON.stringify({
+    type: 'req',
+    id: `abort-${Date.now()}`,
+    method: 'session.abort',
+    params: { sessionId: sessionKey },
+  }));
+});
+
 ipcMain.handle('cli:detect', () => ({
   openclaw: !!findBinary('openclaw'),
   claude: !!findBinary('claude'),
   codex: !!findBinary('codex'),
 }));
 
-ipcMain.handle('config:set-ai-source', (_, aiSource: AISource, apiKey?: string, apiProvider?: string) => {
+ipcMain.handle('config:set-ai-source', async (_, aiSource: AISource, apiKey?: string, apiProvider?: string) => {
   const config = loadConfig();
   const changed = config.aiSource !== aiSource
     || (apiKey !== undefined && config.apiKey !== apiKey)
@@ -1463,7 +1509,7 @@ ipcMain.handle('config:set-ai-source', (_, aiSource: AISource, apiKey?: string, 
   saveConfig(config);
   if (changed) {
     // Only restart when the config actually changed
-    stopServer(false);
+    await stopServer(false);
     generateOpenClawConfig(config);
     startServer();
   }
@@ -1520,15 +1566,18 @@ ipcMain.handle('workspace:rename', (_, id: string, newName: string) => {
   return config;
 });
 
-ipcMain.handle('workspace:delete', (_, id: string) => {
+ipcMain.handle('workspace:delete', async (_, id: string) => {
   const config = loadConfig();
   config.workspaces = config.workspaces.filter((w) => w.id !== id);
   if (config.activeWorkspaceId === id) {
     config.activeWorkspaceId = config.workspaces.length > 0 ? config.workspaces[0].id : null;
-    stopServer(!config.activeWorkspaceId);
     if (config.activeWorkspaceId) {
+      // Hot-reload to the fallback workspace
       saveConfig(config);
-      startServer();
+      generateOpenClawConfig(config);
+    } else {
+      // No workspaces left — stop the gateway
+      await stopServer(true);
     }
   }
   saveConfig(config);
@@ -1541,8 +1590,8 @@ ipcMain.handle('workspace:set-active', (_, id: string) => {
   if (!ws) return config;
   config.activeWorkspaceId = id;
   saveConfig(config);
-  stopServer(false);
-  startServer();
+  // Rewrite openclaw.json — the gateway's config file watcher will hot-reload the workspace
+  generateOpenClawConfig(config);
   return config;
 });
 

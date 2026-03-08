@@ -52,4 +52,15 @@ contextBridge.exposeInMainWorld('api', {
   onConfigChanged: (cb: (config: Config) => void) => {
     ipcRenderer.on('config-changed', (_, config) => cb(config));
   },
+
+  sendChatMessage: (sessionKey: string, message: string) =>
+    ipcRenderer.invoke('chat:send', sessionKey, message),
+  abortChat: (sessionKey: string) =>
+    ipcRenderer.invoke('chat:abort', sessionKey),
+  onChatEvent: (cb: (event: { type: string; payload: Record<string, unknown> }) => void) => {
+    ipcRenderer.on('chat-event', (_, event) => cb(event));
+  },
+  offChatEvent: () => {
+    ipcRenderer.removeAllListeners('chat-event');
+  },
 });

@@ -65,6 +65,23 @@ interface ElectronAPI {
   listSessions: () => Promise<GatewaySession[]>;
   onSessionsUpdated: (cb: (sessions: GatewaySession[]) => void) => void;
   onConfigChanged: (cb: (config: Config) => void) => void;
+
+  sendChatMessage: (sessionKey: string, message: string) => Promise<void>;
+  abortChat: (sessionKey: string) => Promise<void>;
+  onChatEvent: (cb: (event: ChatEvent) => void) => void;
+  offChatEvent: () => void;
+}
+
+interface ChatEvent {
+  type: string;
+  payload: Record<string, unknown>;
+}
+
+interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: number;
 }
 
 interface Window {

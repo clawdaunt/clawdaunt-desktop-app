@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 
 type Status = 'stopped' | 'starting' | 'running' | 'error';
 type TunnelHealth = 'healthy' | 'checking' | 'down';
@@ -35,12 +35,20 @@ export default function WorkspaceConsole({
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const renameRef = useRef<HTMLInputElement>(null);
-  const logRef = useRef<HTMLDivElement>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenu | null>(null);
   const [sessions, setSessions] = useState<GatewaySession[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [logExpanded, setLogExpanded] = useState(false);
   const [expandedWorkspaces, setExpandedWorkspaces] = useState<Set<string>>(new Set());
+
+  // Chat state
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatSessionKey, setChatSessionKey] = useState<string | null>(null);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement>(null);
+  const streamAccum = useRef<Map<string, string>>(new Map());
+  const currentAssistantId = useRef<string | null>(null);
 
   // Settings modal state
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -70,17 +78,155 @@ export default function WorkspaceConsole({
   }, [renaming]);
 
   useEffect(() => {
-    if (logRef.current) {
-      logRef.current.scrollTop = logRef.current.scrollHeight;
-    }
-  }, [gatewayLog]);
-
-  useEffect(() => {
     if (!contextMenu) return;
     const handler = () => setContextMenu(null);
     window.addEventListener('click', handler);
     return () => window.removeEventListener('click', handler);
   }, [contextMenu]);
+
+  // Chat event handling
+  const handleChatEvent = useCallback((event: ChatEvent) => {
+    const { type, payload } = event;
+    const sid = (payload.session_id || payload.sessionId || '') as string;
+
+    if (chatSessionKey && sid && sid !== chatSessionKey) return;
+
+    if (type === 'session.status') {
+      const status = payload.status as string;
+      if (status === 'busy') {
+        setIsStreaming(true);
+      } else if (status === 'idle') {
+        setIsStreaming(false);
+        streamAccum.current.clear();
+        currentAssistantId.current = null;
+      }
+    } else if (type === 'session.idle' || type === 'session.ended') {
+      setIsStreaming(false);
+      streamAccum.current.clear();
+      currentAssistantId.current = null;
+    } else if (type === 'session.error') {
+      setIsStreaming(false);
+      streamAccum.current.clear();
+      const errorText = (payload.error as string) || 'An error occurred';
+      if (currentAssistantId.current) {
+        setChatMessages(prev => prev.map(m =>
+          m.id === currentAssistantId.current
+            ? { ...m, content: m.content + `\n\n_Error: ${errorText}_` }
+            : m
+        ));
+      }
+      currentAssistantId.current = null;
+    } else if (type === 'message.part.updated') {
+      const part = payload.part as Record<string, unknown> | undefined;
+      const delta = payload.delta as string | undefined;
+      if (!part || part.type !== 'text') return;
+
+      const partId = part.id as string;
+      if (delta) {
+        const existing = streamAccum.current.get(partId) || '';
+        const newText = existing + delta;
+        streamAccum.current.set(partId, newText);
+
+        if (currentAssistantId.current) {
+          setChatMessages(prev => prev.map(m =>
+            m.id === currentAssistantId.current ? { ...m, content: newText } : m
+          ));
+        }
+      } else if (part.text) {
+        const text = part.text as string;
+        streamAccum.current.set(partId, text);
+        if (currentAssistantId.current) {
+          setChatMessages(prev => prev.map(m =>
+            m.id === currentAssistantId.current ? { ...m, content: text } : m
+          ));
+        }
+      }
+    }
+  }, [chatSessionKey]);
+
+  useEffect(() => {
+    window.api.onChatEvent(handleChatEvent);
+    return () => { window.api.offChatEvent(); };
+  }, [handleChatEvent]);
+
+  // Auto-scroll chat to bottom
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatMessages]);
+
+  // Reset chat when active workspace changes
+  useEffect(() => {
+    setChatMessages([]);
+    setChatSessionKey(null);
+    setChatInput('');
+    setIsStreaming(false);
+    streamAccum.current.clear();
+    currentAssistantId.current = null;
+  }, [config.activeWorkspaceId]);
+
+  const generateId = () => {
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let result = '';
+    for (let i = 0; i < 16; i++) result += chars[Math.floor(Math.random() * chars.length)];
+    return result;
+  };
+
+  const handleSendMessage = async () => {
+    const text = chatInput.trim();
+    if (!text || isStreaming) return;
+
+    let sessionKey = chatSessionKey;
+    if (!sessionKey) {
+      sessionKey = `desktop:${generateId()}`;
+      setChatSessionKey(sessionKey);
+    }
+
+    const userMsg: ChatMessage = {
+      id: generateId(),
+      role: 'user',
+      content: text,
+      timestamp: Date.now(),
+    };
+
+    const assistantId = generateId();
+    const assistantMsg: ChatMessage = {
+      id: assistantId,
+      role: 'assistant',
+      content: '',
+      timestamp: Date.now(),
+    };
+
+    currentAssistantId.current = assistantId;
+    setChatMessages(prev => [...prev, userMsg, assistantMsg]);
+    setChatInput('');
+    setIsStreaming(true);
+
+    await window.api.sendChatMessage(sessionKey, text);
+  };
+
+  const handleAbort = async () => {
+    if (chatSessionKey) {
+      await window.api.abortChat(chatSessionKey);
+      setIsStreaming(false);
+    }
+  };
+
+  const handleNewChat = () => {
+    setChatMessages([]);
+    setChatSessionKey(null);
+    setChatInput('');
+    setIsStreaming(false);
+    streamAccum.current.clear();
+    currentAssistantId.current = null;
+    chatInputRef.current?.focus();
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSendMessage();
+    }
+  };
 
   const handleCreateWorkspace = async () => {
     onConfigUpdate(await window.api.createWorkspace());
@@ -304,7 +450,7 @@ export default function WorkspaceConsole({
 
       {/* Main content */}
       <div className="main-content">
-        <div className="main-header">
+        <div className="main-header" style={!sidebarOpen ? { paddingLeft: 68 } : undefined}>
           <div>
             {activeWs ? (
               <span className="main-title">{activeWs.name}</span>
@@ -312,14 +458,32 @@ export default function WorkspaceConsole({
               <span className="main-title" style={{ color: 'var(--text-tertiary)' }}>No workspace selected</span>
             )}
           </div>
+          {chatMessages.length > 0 && (
+            <button className="new-chat-btn" onClick={handleNewChat}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="12" y1="5" x2="12" y2="19" />
+                <line x1="5" y1="12" x2="19" y2="12" />
+              </svg>
+              New chat
+            </button>
+          )}
         </div>
 
         <div className="main-body">
-          {sessions.length === 0 && gatewayLog.length === 0 ? (
+          {errorMsg && <div className="error-banner">{errorMsg}</div>}
+
+          {!activeWs ? (
             <div className="welcome-state">
               <div className="welcome-logo">clawdaunt<span>.</span></div>
               <p className="welcome-text">
-                Your AI workspace is ready. Connect your device to get started, or select a workspace from the sidebar.
+                Select a workspace from the sidebar to get started.
+              </p>
+            </div>
+          ) : chatMessages.length === 0 ? (
+            <div className="chat-empty-state">
+              <div className="welcome-logo">clawdaunt<span>.</span></div>
+              <p className="welcome-text">
+                What can I help you with?
               </p>
               <div className="welcome-status">
                 <span className={`connection-dot ${connectionClass}`} />
@@ -329,31 +493,79 @@ export default function WorkspaceConsole({
               </div>
             </div>
           ) : (
-            /* Activity Log */
-            <div className="activity-section">
-              <button className="activity-toggle" onClick={() => setLogExpanded(!logExpanded)}>
-                <span className="section-title">Activity</span>
-                <span className={`activity-chevron${logExpanded ? ' expanded' : ''}`}>
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                    <polyline points="9 18 15 12 9 6" />
-                  </svg>
-                </span>
-              </button>
-              {logExpanded && (
-                <div className="activity-log" ref={logRef}>
-                  {gatewayLog.length === 0 ? (
-                    <div className="activity-log-empty">No activity yet</div>
-                  ) : (
-                    gatewayLog.map((line, i) => (
-                      <div key={i} className="activity-log-line">{line}</div>
-                    ))
-                  )}
+            <div className="chat-messages">
+              {chatMessages.map((msg) => (
+                <div key={msg.id} className={`chat-msg chat-msg-${msg.role}`}>
+                  <div className="chat-msg-avatar">
+                    {msg.role === 'user' ? (
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+                        <circle cx="12" cy="7" r="4" />
+                      </svg>
+                    ) : (
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M12 2L2 7l10 5 10-5-10-5z" />
+                        <path d="M2 17l10 5 10-5" />
+                        <path d="M2 12l10 5 10-5" />
+                      </svg>
+                    )}
+                  </div>
+                  <div className="chat-msg-body">
+                    <span className="chat-msg-role">{msg.role === 'user' ? 'You' : 'Clawdaunt'}</span>
+                    <div className="chat-msg-content">
+                      {msg.content || (msg.role === 'assistant' && isStreaming ? (
+                        <span className="chat-typing-indicator">
+                          <span /><span /><span />
+                        </span>
+                      ) : null)}
+                    </div>
+                  </div>
                 </div>
-              )}
+              ))}
+              <div ref={chatEndRef} />
             </div>
           )}
 
-          {errorMsg && <div className="error-banner">{errorMsg}</div>}
+          {/* Chat input */}
+          {activeWs && (
+            <div className="chat-input-area">
+              <div className="chat-input-container">
+                <textarea
+                  ref={chatInputRef}
+                  className="chat-input"
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  placeholder="Send a message..."
+                  rows={1}
+                  onInput={(e) => {
+                    const el = e.currentTarget;
+                    el.style.height = 'auto';
+                    el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+                  }}
+                />
+                {isStreaming ? (
+                  <button className="chat-stop-btn" onClick={handleAbort} title="Stop generating">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                      <rect x="6" y="6" width="12" height="12" rx="2" />
+                    </svg>
+                  </button>
+                ) : (
+                  <button
+                    className="chat-send-btn"
+                    onClick={handleSendMessage}
+                    disabled={!chatInput.trim()}
+                    title="Send message"
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="22" y1="2" x2="11" y2="13" />
+                      <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -429,6 +641,7 @@ export default function WorkspaceConsole({
                 >
                   <option value="anthropic">Anthropic</option>
                   <option value="openai">OpenAI</option>
+                  <option value="minimax">MiniMax</option>
                 </select>
                 <input
                   className="form-input"
