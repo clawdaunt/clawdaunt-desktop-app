@@ -45,8 +45,11 @@ export default function WorkspaceConsole({
   const [chatInput, setChatInput] = useState('');
   const [chatSessionKey, setChatSessionKey] = useState<string | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [pendingImages, setPendingImages] = useState<ChatAttachment[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const chatInputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const streamAccum = useRef<Map<string, string>>(new Map());
   const currentAssistantId = useRef<string | null>(null);
 
@@ -159,6 +162,7 @@ export default function WorkspaceConsole({
     setChatMessages([]);
     setChatSessionKey(null);
     setChatInput('');
+    setPendingImages([]);
     setIsStreaming(false);
     streamAccum.current.clear();
     currentAssistantId.current = null;
@@ -173,7 +177,8 @@ export default function WorkspaceConsole({
 
   const handleSendMessage = async () => {
     const text = chatInput.trim();
-    if (!text || isStreaming) return;
+    const images = [...pendingImages];
+    if ((!text && images.length === 0) || isStreaming) return;
 
     let sessionKey = chatSessionKey;
     if (!sessionKey) {
@@ -185,6 +190,7 @@ export default function WorkspaceConsole({
       id: generateId(),
       role: 'user',
       content: text,
+      images: images.map(img => img.dataUrl),
       timestamp: Date.now(),
     };
 
@@ -199,9 +205,14 @@ export default function WorkspaceConsole({
     currentAssistantId.current = assistantId;
     setChatMessages(prev => [...prev, userMsg, assistantMsg]);
     setChatInput('');
+    setPendingImages([]);
     setIsStreaming(true);
 
-    await window.api.sendChatMessage(sessionKey, text);
+    await window.api.sendChatMessage(
+      sessionKey,
+      text || '(image attached)',
+      images.length > 0 ? images : undefined,
+    );
   };
 
   const handleAbort = async () => {
@@ -215,6 +226,7 @@ export default function WorkspaceConsole({
     setChatMessages([]);
     setChatSessionKey(null);
     setChatInput('');
+    setPendingImages([]);
     setIsStreaming(false);
     streamAccum.current.clear();
     currentAssistantId.current = null;
@@ -225,6 +237,91 @@ export default function WorkspaceConsole({
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSendMessage();
+    }
+  };
+
+  const handlePickImage = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files) return;
+    Array.from(files).forEach(file => {
+      if (!file.type.startsWith('image/')) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        const base64 = dataUrl.split(',')[1];
+        setPendingImages(prev => [...prev, {
+          type: 'image',
+          mimeType: file.type,
+          fileName: file.name,
+          content: base64,
+          dataUrl,
+        }]);
+      };
+      reader.readAsDataURL(file);
+    });
+    e.target.value = '';
+  };
+
+  const removePendingImage = (index: number) => {
+    setPendingImages(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const files = e.dataTransfer.files;
+    Array.from(files).forEach(file => {
+      if (!file.type.startsWith('image/')) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        const base64 = dataUrl.split(',')[1];
+        setPendingImages(prev => [...prev, {
+          type: 'image',
+          mimeType: file.type,
+          fileName: file.name,
+          content: base64,
+          dataUrl,
+        }]);
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const items = e.clipboardData.items;
+    for (const item of Array.from(items)) {
+      if (!item.type.startsWith('image/')) continue;
+      e.preventDefault();
+      const file = item.getAsFile();
+      if (!file) continue;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        const base64 = dataUrl.split(',')[1];
+        setPendingImages(prev => [...prev, {
+          type: 'image',
+          mimeType: file.type,
+          fileName: `pasted-image.${file.type.split('/')[1]}`,
+          content: base64,
+          dataUrl,
+        }]);
+      };
+      reader.readAsDataURL(file);
     }
   };
 
@@ -512,6 +609,13 @@ export default function WorkspaceConsole({
                   </div>
                   <div className="chat-msg-body">
                     <span className="chat-msg-role">{msg.role === 'user' ? 'You' : 'Clawdaunt'}</span>
+                    {msg.images && msg.images.length > 0 && (
+                      <div className="chat-msg-images">
+                        {msg.images.map((src, i) => (
+                          <img key={i} src={src} className="chat-msg-image" alt="" />
+                        ))}
+                      </div>
+                    )}
                     <div className="chat-msg-content">
                       {msg.content || (msg.role === 'assistant' && isStreaming ? (
                         <span className="chat-typing-indicator">
@@ -528,15 +632,48 @@ export default function WorkspaceConsole({
 
           {/* Chat input */}
           {activeWs && (
-            <div className="chat-input-area">
+            <div
+              className={`chat-input-area${isDragging ? ' dragging' : ''}`}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/gif,image/webp"
+                multiple
+                style={{ display: 'none' }}
+                onChange={handleFileInput}
+              />
               <div className="chat-input-container">
+                {/* Attachment chips inside the container */}
+                {pendingImages.length > 0 && (
+                  <div className="chat-attachment-chips">
+                    {pendingImages.map((img, i) => (
+                      <div key={i} className="chat-attachment-chip">
+                        <img className="chat-attachment-chip-thumb" src={img.dataUrl} alt={img.fileName} />
+                        <span className="chat-attachment-chip-name">{img.fileName}</span>
+                        <button className="chat-attachment-chip-remove" onClick={() => removePendingImage(i)}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <line x1="18" y1="6" x2="6" y2="18" />
+                            <line x1="6" y1="6" x2="18" y2="18" />
+                          </svg>
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Textarea */}
                 <textarea
                   ref={chatInputRef}
                   className="chat-input"
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
                   onKeyDown={handleKeyDown}
-                  placeholder="Send a message..."
+                  onPaste={handlePaste}
+                  placeholder={pendingImages.length > 0 ? 'Reply...' : 'Reply...'}
                   rows={1}
                   onInput={(e) => {
                     const el = e.currentTarget;
@@ -544,26 +681,53 @@ export default function WorkspaceConsole({
                     el.style.height = Math.min(el.scrollHeight, 200) + 'px';
                   }}
                 />
-                {isStreaming ? (
-                  <button className="chat-stop-btn" onClick={handleAbort} title="Stop generating">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                      <rect x="6" y="6" width="12" height="12" rx="2" />
-                    </svg>
-                  </button>
-                ) : (
+
+                {/* Bottom toolbar: + button on left, send on right */}
+                <div className="chat-input-toolbar">
                   <button
-                    className="chat-send-btn"
-                    onClick={handleSendMessage}
-                    disabled={!chatInput.trim()}
-                    title="Send message"
+                    className="chat-attach-btn"
+                    onClick={handlePickImage}
+                    title="Attach image"
+                    disabled={isStreaming}
                   >
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <line x1="22" y1="2" x2="11" y2="13" />
-                      <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="12" y1="5" x2="12" y2="19" />
+                      <line x1="5" y1="12" x2="19" y2="12" />
                     </svg>
                   </button>
-                )}
+                  <div className="chat-input-toolbar-right">
+                    {isStreaming ? (
+                      <button className="chat-stop-btn" onClick={handleAbort} title="Stop generating">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                          <rect x="6" y="6" width="12" height="12" rx="2" />
+                        </svg>
+                      </button>
+                    ) : (
+                      <button
+                        className="chat-send-btn"
+                        onClick={handleSendMessage}
+                        disabled={!chatInput.trim() && pendingImages.length === 0}
+                        title="Send message"
+                      >
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                          <line x1="12" y1="19" x2="12" y2="5" />
+                          <polyline points="5 12 12 5 19 12" />
+                        </svg>
+                      </button>
+                    )}
+                  </div>
+                </div>
               </div>
+              {isDragging && (
+                <div className="chat-drop-overlay">
+                  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                    <circle cx="8.5" cy="8.5" r="1.5" />
+                    <polyline points="21 15 16 10 5 21" />
+                  </svg>
+                  Drop image here
+                </div>
+              )}
             </div>
           )}
         </div>

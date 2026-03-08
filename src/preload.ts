@@ -53,10 +53,11 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('config-changed', (_, config) => cb(config));
   },
 
-  sendChatMessage: (sessionKey: string, message: string) =>
-    ipcRenderer.invoke('chat:send', sessionKey, message),
+  sendChatMessage: (sessionKey: string, message: string, attachments?: ChatAttachment[]) =>
+    ipcRenderer.invoke('chat:send', sessionKey, message, attachments),
   abortChat: (sessionKey: string) =>
     ipcRenderer.invoke('chat:abort', sessionKey),
+  pickImage: () => ipcRenderer.invoke('chat:pick-image'),
   onChatEvent: (cb: (event: { type: string; payload: Record<string, unknown> }) => void) => {
     ipcRenderer.on('chat-event', (_, event) => cb(event));
   },

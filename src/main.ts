@@ -1463,23 +1463,27 @@ ipcMain.handle('server:stop', () => stopServer());
 
 ipcMain.handle('sessions:list', () => Array.from(sessions.values()));
 
-ipcMain.handle('chat:send', (_, sessionKey: string, message: string) => {
+ipcMain.handle('chat:send', (_, sessionKey: string, message: string, attachments?: { type: string; mimeType: string; fileName: string; content: string }[]) => {
   if (!gatewayWs || gatewayWs.readyState !== WebSocket.OPEN || !gatewayWsAuthenticated) {
     send('chat-event', { type: 'error', payload: { error: 'Gateway not connected' } });
     return;
   }
   const reqId = `chat-${Date.now()}`;
-  gatewayWs.send(JSON.stringify({
-    type: 'req',
-    id: reqId,
-    method: 'chat.send',
-    params: {
-      sessionKey,
-      messages: [{ role: 'user', content: message }],
-      model: 'default',
-      stream: true,
-    },
-  }));
+  const params: Record<string, unknown> = {
+    sessionKey,
+    message,
+    model: 'default',
+    stream: true,
+  };
+  if (attachments && attachments.length > 0) {
+    params.attachments = attachments.map(a => ({
+      type: a.type,
+      mimeType: a.mimeType,
+      fileName: a.fileName,
+      content: a.content,
+    }));
+  }
+  gatewayWs.send(JSON.stringify({ type: 'req', id: reqId, method: 'chat.send', params }));
 });
 
 ipcMain.handle('chat:abort', (_, sessionKey: string) => {
@@ -1490,6 +1494,28 @@ ipcMain.handle('chat:abort', (_, sessionKey: string) => {
     method: 'session.abort',
     params: { sessionId: sessionKey },
   }));
+});
+
+ipcMain.handle('chat:pick-image', async () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return null;
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openFile'],
+    filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }],
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  const filePath = result.filePaths[0];
+  const buffer = fs.readFileSync(filePath);
+  const ext = path.extname(filePath).toLowerCase().slice(1);
+  const mimeMap: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
+  const mimeType = mimeMap[ext] || 'image/jpeg';
+  const base64 = buffer.toString('base64');
+  return {
+    type: 'image',
+    mimeType,
+    fileName: path.basename(filePath),
+    content: base64,
+    dataUrl: `data:${mimeType};base64,${base64}`,
+  };
 });
 
 ipcMain.handle('cli:detect', () => ({

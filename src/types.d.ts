@@ -66,8 +66,9 @@ interface ElectronAPI {
   onSessionsUpdated: (cb: (sessions: GatewaySession[]) => void) => void;
   onConfigChanged: (cb: (config: Config) => void) => void;
 
-  sendChatMessage: (sessionKey: string, message: string) => Promise<void>;
+  sendChatMessage: (sessionKey: string, message: string, attachments?: ChatAttachment[]) => Promise<void>;
   abortChat: (sessionKey: string) => Promise<void>;
+  pickImage: () => Promise<ChatAttachment | null>;
   onChatEvent: (cb: (event: ChatEvent) => void) => void;
   offChatEvent: () => void;
 }
@@ -77,10 +78,19 @@ interface ChatEvent {
   payload: Record<string, unknown>;
 }
 
+interface ChatAttachment {
+  type: 'image';
+  mimeType: string;
+  fileName: string;
+  content: string;
+  dataUrl: string;
+}
+
 interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  images?: string[];
   timestamp: number;
 }
 
