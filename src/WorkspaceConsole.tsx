@@ -37,15 +37,20 @@ export default function WorkspaceConsole({
   const renameRef = useRef<HTMLInputElement>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenu | null>(null);
   const [sessions, setSessions] = useState<GatewaySession[]>([]);
+  const [pastSessions, setPastSessions] = useState<PersistentSession[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarTab, setSidebarTab] = useState<'workspaces' | 'sessions'>('workspaces');
   const [expandedWorkspaces, setExpandedWorkspaces] = useState<Set<string>>(new Set());
+  const [sessionContextMenu, setSessionContextMenu] = useState<{ x: number; y: number; session: PersistentSession } | null>(null);
 
   // Chat state
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [chatSessionKey, setChatSessionKey] = useState<string | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [viewingPastSession, setViewingPastSession] = useState(false);
   const [pendingImages, setPendingImages] = useState<ChatAttachment[]>([]);
+  const [pendingFiles, setPendingFiles] = useState<FileReference[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const chatInputRef = useRef<HTMLTextAreaElement>(null);
@@ -59,6 +64,8 @@ export default function WorkspaceConsole({
   const [apiProvider, setApiProvider] = useState(config.apiProvider || 'anthropic');
   const [cliStatus, setCLIStatus] = useState<CLIStatus>({ openclaw: false, claude: false, codex: false });
   const [keySaved, setKeySaved] = useState(false);
+  const [providerMenuOpen, setProviderMenuOpen] = useState(false);
+  const providerMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     window.api.detectCLIs().then(setCLIStatus);
@@ -68,6 +75,17 @@ export default function WorkspaceConsole({
     window.api.listSessions().then(setSessions);
     window.api.onSessionsUpdated(setSessions);
   }, []);
+
+  // Poll persistent past sessions from gateway
+  useEffect(() => {
+    if (status !== 'running') { setPastSessions([]); return; }
+    const fetch = () => {
+      window.api.listPersistentSessions().then(setPastSessions).catch(() => {});
+    };
+    fetch();
+    const interval = setInterval(fetch, 5000);
+    return () => clearInterval(interval);
+  }, [status]);
 
   // Auto-expand active workspace
   useEffect(() => {
@@ -87,12 +105,23 @@ export default function WorkspaceConsole({
     return () => window.removeEventListener('click', handler);
   }, [contextMenu]);
 
+  useEffect(() => {
+    if (!sessionContextMenu) return;
+    const handler = () => setSessionContextMenu(null);
+    window.addEventListener('click', handler);
+    return () => window.removeEventListener('click', handler);
+  }, [sessionContextMenu]);
+
   // Chat event handling
   const handleChatEvent = useCallback((event: ChatEvent) => {
     const { type, payload } = event;
     const sid = (payload.session_id || payload.sessionId || '') as string;
 
-    if (chatSessionKey && sid && sid !== chatSessionKey) return;
+    console.log('[chatEvent]', type, 'sid:', sid, 'chatSessionKey:', chatSessionKey);
+    if (chatSessionKey && sid && sid !== chatSessionKey) {
+      console.log('[chatEvent] SKIPPED — session mismatch');
+      return;
+    }
 
     if (type === 'session.status') {
       const status = payload.status as string;
@@ -107,7 +136,7 @@ export default function WorkspaceConsole({
       setIsStreaming(false);
       streamAccum.current.clear();
       currentAssistantId.current = null;
-    } else if (type === 'session.error') {
+    } else if (type === 'session.error' || type === 'error') {
       setIsStreaming(false);
       streamAccum.current.clear();
       const errorText = (payload.error as string) || 'An error occurred';
@@ -163,6 +192,7 @@ export default function WorkspaceConsole({
     setChatSessionKey(null);
     setChatInput('');
     setPendingImages([]);
+    setPendingFiles([]);
     setIsStreaming(false);
     streamAccum.current.clear();
     currentAssistantId.current = null;
@@ -178,19 +208,23 @@ export default function WorkspaceConsole({
   const handleSendMessage = async () => {
     const text = chatInput.trim();
     const images = [...pendingImages];
-    if ((!text && images.length === 0) || isStreaming) return;
+    const files = [...pendingFiles];
+    console.log('[handleSendMessage] text:', text, 'isStreaming:', isStreaming, 'chatSessionKey:', chatSessionKey);
+    if ((!text && images.length === 0 && files.length === 0) || isStreaming) return;
 
     let sessionKey = chatSessionKey;
     if (!sessionKey) {
       sessionKey = `desktop:${generateId()}`;
       setChatSessionKey(sessionKey);
     }
+    console.log('[handleSendMessage] sending with sessionKey:', sessionKey);
 
     const userMsg: ChatMessage = {
       id: generateId(),
       role: 'user',
       content: text,
       images: images.map(img => img.dataUrl),
+      files: files.length > 0 ? files : undefined,
       timestamp: Date.now(),
     };
 
@@ -206,19 +240,28 @@ export default function WorkspaceConsole({
     setChatMessages(prev => [...prev, userMsg, assistantMsg]);
     setChatInput('');
     setPendingImages([]);
+    setPendingFiles([]);
     setIsStreaming(true);
 
+    const filePaths = files.filter(f => f.path).map(f => f.path);
     await window.api.sendChatMessage(
       sessionKey,
-      text || '(image attached)',
+      text || (images.length > 0 ? '(image attached)' : '(files attached)'),
       images.length > 0 ? images : undefined,
+      filePaths.length > 0 ? filePaths : undefined,
     );
   };
 
   const handleAbort = async () => {
     if (chatSessionKey) {
-      await window.api.abortChat(chatSessionKey);
+      try {
+        await window.api.abortChat(chatSessionKey);
+      } catch {
+        // Abort may fail if gateway disconnected
+      }
       setIsStreaming(false);
+      streamAccum.current.clear();
+      currentAssistantId.current = null;
     }
   };
 
@@ -227,10 +270,37 @@ export default function WorkspaceConsole({
     setChatSessionKey(null);
     setChatInput('');
     setPendingImages([]);
+    setPendingFiles([]);
     setIsStreaming(false);
+    setViewingPastSession(false);
     streamAccum.current.clear();
     currentAssistantId.current = null;
     chatInputRef.current?.focus();
+  };
+
+  const handleLoadPastSession = async (session: PersistentSession) => {
+    setChatMessages([]);
+    setChatSessionKey(session.id);
+    setViewingPastSession(true);
+    setIsStreaming(false);
+    streamAccum.current.clear();
+    currentAssistantId.current = null;
+    setPendingImages([]);
+    setPendingFiles([]);
+    try {
+      const history = await window.api.loadSessionHistory(session.id);
+      setChatMessages(history);
+    } catch { /* ignore */ }
+  };
+
+  const handleDeletePastSession = async (session: PersistentSession) => {
+    try {
+      await window.api.deleteSession(session.gatewayKey);
+      setPastSessions(prev => prev.filter(s => s.id !== session.id));
+      // If we're viewing this session, clear the chat
+      if (chatSessionKey === session.id) handleNewChat();
+    } catch { /* ignore */ }
+    setSessionContextMenu(null);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -240,34 +310,51 @@ export default function WorkspaceConsole({
     }
   };
 
-  const handlePickImage = () => {
+  const handleAddAttachment = () => {
     fileInputRef.current?.click();
   };
 
-  const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files) return;
+    const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
     Array.from(files).forEach(file => {
-      if (!file.type.startsWith('image/')) return;
-      const reader = new FileReader();
-      reader.onload = () => {
-        const dataUrl = reader.result as string;
-        const base64 = dataUrl.split(',')[1];
-        setPendingImages(prev => [...prev, {
-          type: 'image',
-          mimeType: file.type,
-          fileName: file.name,
-          content: base64,
-          dataUrl,
-        }]);
-      };
-      reader.readAsDataURL(file);
+      const filePath = (file as File & { path?: string }).path || '';
+      if (IMAGE_TYPES.has(file.type)) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          const base64 = dataUrl.split(',')[1];
+          setPendingImages(prev => [...prev, {
+            type: 'image',
+            mimeType: file.type,
+            fileName: file.name,
+            content: base64,
+            dataUrl,
+          }]);
+        };
+        reader.readAsDataURL(file);
+      } else {
+        setPendingFiles(prev => {
+          const key = filePath || file.name;
+          if (prev.some(f => (f.path || f.fileName) === key)) return prev;
+          return [...prev, {
+            path: filePath,
+            fileName: file.name,
+            relativePath: file.name,
+          }];
+        });
+      }
     });
     e.target.value = '';
   };
 
   const removePendingImage = (index: number) => {
     setPendingImages(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const removePendingFile = (index: number) => {
+    setPendingFiles(prev => prev.filter((_, i) => i !== index));
   };
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -348,19 +435,31 @@ export default function WorkspaceConsole({
 
   const handleSaveApiKey = async () => {
     if (!apiKey.trim()) return;
-    onConfigUpdate(await window.api.setAISource(config.aiSource, apiKey.trim(), apiProvider));
+    onConfigUpdate(await window.api.setAISource('api-key', apiKey.trim(), apiProvider));
     setKeySaved(true);
     setTimeout(() => setKeySaved(false), 2000);
   };
 
   useEffect(() => {
-    setApiKey(config.apiKey || '');
-    setApiProvider(config.apiProvider || 'anthropic');
-  }, [config.apiKey, config.apiProvider]);
+    const provider = config.apiProvider || 'anthropic';
+    setApiProvider(provider);
+    setApiKey(config.apiKeys?.[provider] || config.apiKey || '');
+  }, [config.apiKey, config.apiProvider, config.apiKeys]);
 
   const handleContextMenu = (e: React.MouseEvent, wsId: string) => {
     e.preventDefault();
     setContextMenu({ x: e.clientX, y: e.clientY, wsId });
+  };
+
+  const formatTimeAgo = (unixSecs: number) => {
+    const secs = Math.floor(Date.now() / 1000 - unixSecs);
+    if (secs < 60) return 'just now';
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ago`;
   };
 
   const formatElapsed = (startedAt: number) => {
@@ -380,6 +479,37 @@ export default function WorkspaceConsole({
       return next;
     });
   };
+
+  // Close provider menu on outside click
+  useEffect(() => {
+    if (!providerMenuOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (providerMenuRef.current && !providerMenuRef.current.contains(e.target as Node)) {
+        setProviderMenuOpen(false);
+      }
+    };
+    window.addEventListener('mousedown', handler);
+    return () => window.removeEventListener('mousedown', handler);
+  }, [providerMenuOpen]);
+
+  const handleSwitchProvider = async (aiSource: AISource, provider?: string) => {
+    const newApiKey = aiSource === 'api-key' ? config.apiKey : undefined;
+    onConfigUpdate(await window.api.setAISource(aiSource, newApiKey, provider));
+    setProviderMenuOpen(false);
+  };
+
+  // Provider display info
+  const PROVIDERS: { id: string; aiSource: AISource; apiProvider?: string; label: string; description: string; available: boolean }[] = [
+    { id: 'claude-cli', aiSource: 'claude-cli', label: 'Claude Code', description: 'Via Claude CLI', available: cliStatus.claude },
+    { id: 'codex-cli', aiSource: 'codex-cli', label: 'Codex', description: 'Via Codex CLI', available: cliStatus.codex },
+    { id: 'anthropic', aiSource: 'api-key', apiProvider: 'anthropic', label: 'Anthropic API', description: 'Claude Sonnet 4', available: !!(config.apiKey && config.apiProvider === 'anthropic') },
+    { id: 'openai', aiSource: 'api-key', apiProvider: 'openai', label: 'OpenAI API', description: 'GPT-4o', available: !!(config.apiKey && config.apiProvider === 'openai') },
+    { id: 'minimax', aiSource: 'api-key', apiProvider: 'minimax', label: 'MiniMax API', description: 'MiniMax M2.5', available: !!(config.apiKey && config.apiProvider === 'minimax') },
+    { id: 'gemini', aiSource: 'api-key', apiProvider: 'gemini', label: 'Gemini API', description: 'Gemini 2.5 Pro', available: !!(config.apiKey && config.apiProvider === 'gemini') },
+  ];
+
+  const currentProviderId = config.aiSource === 'api-key' ? config.apiProvider : config.aiSource;
+  const currentProvider = PROVIDERS.find(p => p.id === currentProviderId) || PROVIDERS[0];
 
   const activeWs = config.workspaces.find((w) => w.id === config.activeWorkspaceId) ?? null;
 
@@ -426,15 +556,57 @@ export default function WorkspaceConsole({
               <line x1="9" y1="3" x2="9" y2="21" />
             </svg>
           </button>
-          <button className="new-workspace-btn" onClick={handleCreateWorkspace}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <line x1="12" y1="5" x2="12" y2="19" />
-              <line x1="5" y1="12" x2="19" y2="12" />
-            </svg>
-            New workspace
+          {sidebarTab === 'workspaces' ? (
+            <button className="new-workspace-btn" onClick={handleCreateWorkspace}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="12" y1="5" x2="12" y2="19" />
+                <line x1="5" y1="12" x2="19" y2="12" />
+              </svg>
+              New workspace
+            </button>
+          ) : (
+            <button className="new-workspace-btn" onClick={handleNewChat}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="12" y1="5" x2="12" y2="19" />
+                <line x1="5" y1="12" x2="19" y2="12" />
+              </svg>
+              New chat
+            </button>
+          )}
+        </div>
+
+        <div className="sidebar-tabs">
+          <button
+            className={`sidebar-tab${sidebarTab === 'workspaces' ? ' active' : ''}`}
+            onClick={() => {
+              setSidebarTab('workspaces');
+              if (viewingPastSession) {
+                setChatMessages([]);
+                setChatSessionKey(null);
+                setChatInput('');
+                setPendingImages([]);
+                setPendingFiles([]);
+                setIsStreaming(false);
+                setViewingPastSession(false);
+                streamAccum.current.clear();
+                currentAssistantId.current = null;
+              }
+            }}
+          >
+            Workspaces
+          </button>
+          <button
+            className={`sidebar-tab${sidebarTab === 'sessions' ? ' active' : ''}`}
+            onClick={() => setSidebarTab('sessions')}
+          >
+            Sessions
+            {pastSessions.length > 0 && (
+              <span className="sidebar-tab-badge">{pastSessions.length}</span>
+            )}
           </button>
         </div>
 
+        {sidebarTab === 'workspaces' ? (
         <div className="workspace-list">
           {config.workspaces.map((ws) => {
             const wsSessions = sessionsByWorkspace.get(ws.id) || [];
@@ -518,6 +690,33 @@ export default function WorkspaceConsole({
             </div>
           )}
         </div>
+        ) : (
+        <div className="workspace-list">
+          {pastSessions.length === 0 ? (
+            <div className="sessions-empty">
+              <span className="sessions-empty-text">No past sessions</span>
+            </div>
+          ) : (
+            pastSessions.map((s) => (
+              <div
+                key={s.id}
+                className={`ws-session-item past-session${chatSessionKey === s.id ? ' active' : ''}`}
+                onClick={() => handleLoadPastSession(s)}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setSessionContextMenu({ x: e.clientX, y: e.clientY, session: s });
+                }}
+                title={s.title}
+              >
+                <span className="ws-session-dot idle" />
+                <span className="ws-session-title">{s.title}</span>
+                <span className="ws-session-time">{formatTimeAgo(s.updatedAt)}</span>
+              </div>
+            ))
+          )}
+        </div>
+        )}
 
         <div className="sidebar-bottom">
           <div className="sidebar-bottom-left">
@@ -548,12 +747,87 @@ export default function WorkspaceConsole({
       {/* Main content */}
       <div className="main-content">
         <div className="main-header" style={!sidebarOpen ? { paddingLeft: 68 } : undefined}>
-          <div>
-            {activeWs ? (
-              <span className="main-title">{activeWs.name}</span>
-            ) : (
-              <span className="main-title" style={{ color: 'var(--text-tertiary)' }}>No workspace selected</span>
-            )}
+          <div className="main-header-left">
+            {/* Provider picker */}
+            <div className="provider-picker" ref={providerMenuRef}>
+              <button
+                className="provider-picker-btn"
+                onClick={() => setProviderMenuOpen(!providerMenuOpen)}
+              >
+                <span className="provider-picker-label">{currentProvider.label}</span>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </button>
+              {providerMenuOpen && (
+                <div className="provider-menu">
+                  <div className="provider-menu-group">
+                    <span className="provider-menu-group-label">Local CLI</span>
+                    {PROVIDERS.filter(p => p.aiSource !== 'api-key').map((p) => (
+                      <button
+                        key={p.id}
+                        className={`provider-menu-item${p.id === currentProviderId ? ' active' : ''}`}
+                        onClick={() => {
+                          if (p.available) handleSwitchProvider(p.aiSource, p.apiProvider);
+                        }}
+                        disabled={!p.available}
+                      >
+                        <div className="provider-menu-item-info">
+                          <span className="provider-menu-item-label">{p.label}</span>
+                          <span className="provider-menu-item-desc">{p.description}</span>
+                        </div>
+                        {p.id === currentProviderId && (
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                            <polyline points="20 6 9 17 4 12" />
+                          </svg>
+                        )}
+                        {!p.available && (
+                          <span className="provider-menu-item-badge">Not installed</span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="provider-menu-divider" />
+                  <div className="provider-menu-group">
+                    <span className="provider-menu-group-label">API Providers</span>
+                    {PROVIDERS.filter(p => p.aiSource === 'api-key').map((p) => {
+                      const hasKey = !!(config.apiKey && config.apiProvider === p.apiProvider);
+                      return (
+                        <button
+                          key={p.id}
+                          className={`provider-menu-item${p.id === currentProviderId ? ' active' : ''}`}
+                          onClick={() => {
+                            if (hasKey) {
+                              handleSwitchProvider(p.aiSource, p.apiProvider);
+                            } else {
+                              setApiProvider(p.apiProvider || 'anthropic');
+                              setSettingsOpen(true);
+                              setProviderMenuOpen(false);
+                            }
+                          }}
+                        >
+                          <div className="provider-menu-item-info">
+                            <span className="provider-menu-item-label">{p.label}</span>
+                            <span className="provider-menu-item-desc">{p.description}</span>
+                          </div>
+                          {p.id === currentProviderId && (
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                              <polyline points="20 6 9 17 4 12" />
+                            </svg>
+                          )}
+                          {!hasKey && (
+                            <span className="provider-menu-item-badge setup">Add key</span>
+                          )}
+                          {hasKey && p.id !== currentProviderId && (
+                            <span className="provider-menu-item-badge ready">Ready</span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
           {chatMessages.length > 0 && (
             <button className="new-chat-btn" onClick={handleNewChat}>
@@ -608,7 +882,7 @@ export default function WorkspaceConsole({
                     )}
                   </div>
                   <div className="chat-msg-body">
-                    <span className="chat-msg-role">{msg.role === 'user' ? 'You' : 'Clawdaunt'}</span>
+                    <span className="chat-msg-role">{msg.role === 'user' ? 'You' : 'AI'}</span>
                     {msg.images && msg.images.length > 0 && (
                       <div className="chat-msg-images">
                         {msg.images.map((src, i) => (
@@ -616,8 +890,21 @@ export default function WorkspaceConsole({
                         ))}
                       </div>
                     )}
+                    {msg.files && msg.files.length > 0 && (
+                      <div className="chat-msg-files">
+                        {msg.files.map((file, i) => (
+                          <div key={i} className="chat-msg-file-chip">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                              <polyline points="14 2 14 8 20 8" />
+                            </svg>
+                            <span>{file.relativePath}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                     <div className="chat-msg-content">
-                      {msg.content || (msg.role === 'assistant' && isStreaming ? (
+                      {(msg.content && msg.content.trim()) || (msg.role === 'assistant' && isStreaming ? (
                         <span className="chat-typing-indicator">
                           <span /><span /><span />
                         </span>
@@ -641,17 +928,15 @@ export default function WorkspaceConsole({
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="image/png,image/jpeg,image/gif,image/webp"
                 multiple
                 style={{ display: 'none' }}
-                onChange={handleFileInput}
+                onChange={handleFileInputChange}
               />
               <div className="chat-input-container">
-                {/* Attachment chips inside the container */}
-                {pendingImages.length > 0 && (
+                {(pendingImages.length > 0 || pendingFiles.length > 0) && (
                   <div className="chat-attachment-chips">
                     {pendingImages.map((img, i) => (
-                      <div key={i} className="chat-attachment-chip">
+                      <div key={`img-${i}`} className="chat-attachment-chip">
                         <img className="chat-attachment-chip-thumb" src={img.dataUrl} alt={img.fileName} />
                         <span className="chat-attachment-chip-name">{img.fileName}</span>
                         <button className="chat-attachment-chip-remove" onClick={() => removePendingImage(i)}>
@@ -662,10 +947,24 @@ export default function WorkspaceConsole({
                         </button>
                       </div>
                     ))}
+                    {pendingFiles.map((file, i) => (
+                      <div key={`file-${i}`} className="chat-attachment-chip chat-attachment-chip-file">
+                        <svg className="chat-attachment-chip-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                          <polyline points="14 2 14 8 20 8" />
+                        </svg>
+                        <span className="chat-attachment-chip-name">{file.relativePath}</span>
+                        <button className="chat-attachment-chip-remove" onClick={() => removePendingFile(i)}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <line x1="18" y1="6" x2="6" y2="18" />
+                            <line x1="6" y1="6" x2="18" y2="18" />
+                          </svg>
+                        </button>
+                      </div>
+                    ))}
                   </div>
                 )}
 
-                {/* Textarea */}
                 <textarea
                   ref={chatInputRef}
                   className="chat-input"
@@ -673,7 +972,7 @@ export default function WorkspaceConsole({
                   onChange={(e) => setChatInput(e.target.value)}
                   onKeyDown={handleKeyDown}
                   onPaste={handlePaste}
-                  placeholder={pendingImages.length > 0 ? 'Reply...' : 'Reply...'}
+                  placeholder="Reply..."
                   rows={1}
                   onInput={(e) => {
                     const el = e.currentTarget;
@@ -682,12 +981,11 @@ export default function WorkspaceConsole({
                   }}
                 />
 
-                {/* Bottom toolbar: + button on left, send on right */}
                 <div className="chat-input-toolbar">
                   <button
                     className="chat-attach-btn"
-                    onClick={handlePickImage}
-                    title="Attach image"
+                    onClick={handleAddAttachment}
+                    title="Add file or image"
                     disabled={isStreaming}
                   >
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -706,7 +1004,7 @@ export default function WorkspaceConsole({
                       <button
                         className="chat-send-btn"
                         onClick={handleSendMessage}
-                        disabled={!chatInput.trim() && pendingImages.length === 0}
+                        disabled={!chatInput.trim() && pendingImages.length === 0 && pendingFiles.length === 0}
                         title="Send message"
                       >
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
@@ -765,6 +1063,22 @@ export default function WorkspaceConsole({
         );
       })()}
 
+      {/* Session context menu */}
+      {sessionContextMenu && (
+        <div
+          className="context-menu"
+          style={{ top: sessionContextMenu.y, left: sessionContextMenu.x }}
+          onClick={() => setSessionContextMenu(null)}
+        >
+          <div className="context-menu-item" onClick={() => handleLoadPastSession(sessionContextMenu.session)}>
+            Open
+          </div>
+          <div className="context-menu-item danger" onClick={() => handleDeletePastSession(sessionContextMenu.session)}>
+            Delete
+          </div>
+        </div>
+      )}
+
       {/* Settings Modal */}
       {settingsOpen && (
         <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}>
@@ -773,44 +1087,78 @@ export default function WorkspaceConsole({
             <h2 className="modal-title">Settings</h2>
 
             <div className="settings-section">
-              <span className="settings-label">CLI Status</span>
+              <span className="settings-label">AI Provider</span>
               {!cliStatus.openclaw && (
                 <p className="cli-warning">openclaw CLI not found — install it to enable full functionality</p>
               )}
-              <div className="cli-list">
-                <div className="cli-row">
-                  <span className={`cli-dot ${cliStatus.claude ? 'installed' : 'missing'}`} />
-                  <span className="cli-name">Claude CLI</span>
-                  <span className={`cli-status-text ${cliStatus.claude ? 'available' : 'unavailable'}`}>
-                    {cliStatus.claude ? 'Installed' : 'Not found'}
-                  </span>
-                </div>
-                <div className="cli-row">
-                  <span className={`cli-dot ${cliStatus.codex ? 'installed' : 'missing'}`} />
-                  <span className="cli-name">Codex CLI</span>
-                  <span className={`cli-status-text ${cliStatus.codex ? 'available' : 'unavailable'}`}>
-                    {cliStatus.codex ? 'Installed' : 'Not found'}
-                  </span>
-                </div>
+
+              {/* CLI options */}
+              <div className="provider-options">
+                <button
+                  className={`provider-option${config.aiSource === 'claude-cli' ? ' active' : ''}`}
+                  onClick={() => cliStatus.claude && handleSwitchProvider('claude-cli')}
+                  disabled={!cliStatus.claude}
+                >
+                  <span className={`provider-option-radio${config.aiSource === 'claude-cli' ? ' selected' : ''}`} />
+                  <div className="provider-option-info">
+                    <span className="provider-option-name">Claude Code</span>
+                    <span className="provider-option-detail">Uses your Claude CLI login</span>
+                  </div>
+                  {!cliStatus.claude && <span className="provider-menu-item-badge">Not installed</span>}
+                </button>
+                <button
+                  className={`provider-option${config.aiSource === 'codex-cli' ? ' active' : ''}`}
+                  onClick={() => cliStatus.codex && handleSwitchProvider('codex-cli')}
+                  disabled={!cliStatus.codex}
+                >
+                  <span className={`provider-option-radio${config.aiSource === 'codex-cli' ? ' selected' : ''}`} />
+                  <div className="provider-option-info">
+                    <span className="provider-option-name">Codex</span>
+                    <span className="provider-option-detail">Uses your Codex CLI login</span>
+                  </div>
+                  {!cliStatus.codex && <span className="provider-menu-item-badge">Not installed</span>}
+                </button>
+
+                {/* API key option */}
+                <button
+                  className={`provider-option${config.aiSource === 'api-key' ? ' active' : ''}`}
+                  onClick={() => {
+                    if (config.apiKey) {
+                      handleSwitchProvider('api-key', apiProvider);
+                    }
+                  }}
+                >
+                  <span className={`provider-option-radio${config.aiSource === 'api-key' ? ' selected' : ''}`} />
+                  <div className="provider-option-info">
+                    <span className="provider-option-name">API Key</span>
+                    <span className="provider-option-detail">Use an API key directly</span>
+                  </div>
+                </button>
               </div>
             </div>
 
+            {/* API key config — always visible so users can set up keys */}
             <div className="settings-section">
-              <span className="settings-label">API Key</span>
+              <span className="settings-label">API Key Configuration</span>
               <div className="api-form">
                 <select
                   className="form-select"
                   value={apiProvider}
-                  onChange={(e) => setApiProvider(e.target.value)}
+                  onChange={(e) => {
+                    const provider = e.target.value;
+                    setApiProvider(provider);
+                    setApiKey(config.apiKeys?.[provider] || '');
+                  }}
                 >
-                  <option value="anthropic">Anthropic</option>
-                  <option value="openai">OpenAI</option>
-                  <option value="minimax">MiniMax</option>
+                  <option value="anthropic">Anthropic — Claude Sonnet 4</option>
+                  <option value="openai">OpenAI — GPT-4o</option>
+                  <option value="minimax">MiniMax — M2.5</option>
+                  <option value="gemini">Google Gemini — 2.5 Pro</option>
                 </select>
                 <input
                   className="form-input"
-                  type="password"
-                  placeholder={config.apiKey ? 'Key saved — enter new to replace' : 'Paste API key'}
+                  type="text"
+                  placeholder="Paste API key"
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
                   onKeyDown={(e) => {

@@ -18,6 +18,7 @@ interface Config {
   aiSource: AISource;
   apiKey: string;
   apiProvider: string;
+  apiKeys: Record<string, string>;  // provider → key
 }
 
 interface GatewaySession {
@@ -27,6 +28,13 @@ interface GatewaySession {
   skill?: string;
   startedAt: number;
   workspaceId?: string;
+}
+
+interface PersistentSession {
+  id: string;
+  gatewayKey: string;
+  title: string;
+  updatedAt: number;
 }
 
 interface CLIStatus {
@@ -63,12 +71,16 @@ interface ElectronAPI {
   onGatewayLog: (cb: (text: string) => void) => void;
 
   listSessions: () => Promise<GatewaySession[]>;
+  listPersistentSessions: () => Promise<PersistentSession[]>;
+  deleteSession: (gatewayKey: string) => Promise<boolean>;
+  loadSessionHistory: (sessionKey: string) => Promise<ChatMessage[]>;
   onSessionsUpdated: (cb: (sessions: GatewaySession[]) => void) => void;
   onConfigChanged: (cb: (config: Config) => void) => void;
 
-  sendChatMessage: (sessionKey: string, message: string, attachments?: ChatAttachment[]) => Promise<void>;
+  sendChatMessage: (sessionKey: string, message: string, attachments?: ChatAttachment[], fileRefs?: string[]) => Promise<void>;
   abortChat: (sessionKey: string) => Promise<void>;
   pickImage: () => Promise<ChatAttachment | null>;
+  pickFile: () => Promise<FileReference[] | null>;
   onChatEvent: (cb: (event: ChatEvent) => void) => void;
   offChatEvent: () => void;
 }
@@ -86,11 +98,19 @@ interface ChatAttachment {
   dataUrl: string;
 }
 
+interface FileReference {
+  path: string;
+  fileName: string;
+  relativePath: string;
+  imageData?: { mimeType: string; content: string; dataUrl: string };
+}
+
 interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
   images?: string[];
+  files?: FileReference[];
   timestamp: number;
 }
 

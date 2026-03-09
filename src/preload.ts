@@ -46,6 +46,9 @@ contextBridge.exposeInMainWorld('api', {
   },
 
   listSessions: () => ipcRenderer.invoke('sessions:list'),
+  listPersistentSessions: () => ipcRenderer.invoke('sessions:list-persistent'),
+  deleteSession: (gatewayKey: string) => ipcRenderer.invoke('sessions:delete', gatewayKey),
+  loadSessionHistory: (sessionKey: string) => ipcRenderer.invoke('sessions:load-history', sessionKey),
   onSessionsUpdated: (cb: (sessions: GatewaySession[]) => void) => {
     ipcRenderer.on('sessions-updated', (_, sessions) => cb(sessions));
   },
@@ -53,11 +56,12 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('config-changed', (_, config) => cb(config));
   },
 
-  sendChatMessage: (sessionKey: string, message: string, attachments?: ChatAttachment[]) =>
-    ipcRenderer.invoke('chat:send', sessionKey, message, attachments),
+  sendChatMessage: (sessionKey: string, message: string, attachments?: ChatAttachment[], fileRefs?: string[]) =>
+    ipcRenderer.invoke('chat:send', sessionKey, message, attachments, fileRefs),
   abortChat: (sessionKey: string) =>
     ipcRenderer.invoke('chat:abort', sessionKey),
   pickImage: () => ipcRenderer.invoke('chat:pick-image'),
+  pickFile: () => ipcRenderer.invoke('chat:pick-file'),
   onChatEvent: (cb: (event: { type: string; payload: Record<string, unknown> }) => void) => {
     ipcRenderer.on('chat-event', (_, event) => cb(event));
   },

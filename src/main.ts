@@ -36,8 +36,9 @@ interface Config {
   workspaces: Workspace[];
   activeWorkspaceId: string | null;
   aiSource: AISource;
-  apiKey: string;        // only used when aiSource === 'api-key'
+  apiKey: string;        // active key (for current apiProvider)
   apiProvider: string;   // e.g. 'anthropic', 'openai' — only used with api-key
+  apiKeys: Record<string, string>;  // provider → key
 }
 
 const CONFIG_DIR = path.join(os.homedir(), '.clawdaunt');
@@ -58,6 +59,7 @@ function loadConfig(): Config {
       aiSource: 'claude-cli',
       apiKey: '',
       apiProvider: 'anthropic',
+      apiKeys: {},
     };
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + '\n');
     return config;
@@ -80,6 +82,7 @@ function loadConfig(): Config {
       aiSource: raw.aiSource ?? 'claude-cli',
       apiKey: raw.apiKey ?? '',
       apiProvider: raw.apiProvider ?? 'anthropic',
+      apiKeys: raw.apiKeys ?? {},
     };
     delete (raw as Record<string, unknown>).repos;
     saveConfig(config);
@@ -90,6 +93,12 @@ function loadConfig(): Config {
   if (!raw.aiSource) raw.aiSource = 'claude-cli';
   if (!raw.apiKey) raw.apiKey = '';
   if (!raw.apiProvider) raw.apiProvider = 'anthropic';
+  if (!raw.apiKeys) raw.apiKeys = {};
+
+  // Migrate: if apiKey exists but apiKeys doesn't have it, store it
+  if (raw.apiKey && raw.apiProvider && !raw.apiKeys[raw.apiProvider]) {
+    raw.apiKeys[raw.apiProvider] = raw.apiKey;
+  }
 
   return raw as Config;
 }
@@ -132,17 +141,50 @@ function generateOpenClawConfig(config: Config): void {
   }
 
   // Select model based on AI source
+  // For api-key providers, check if openclaw has auth registered. If not, fall back to claude-cli.
   let primary: string;
   if (config.aiSource === 'claude-cli') {
     primary = 'claude-cli/opus-4.6';
   } else if (config.aiSource === 'codex-cli') {
     primary = 'codex-cli/gpt-5.3-codex';
   } else if (config.aiSource === 'api-key') {
-    primary = config.apiProvider === 'openai'
-      ? 'openai/gpt-4o'
-      : config.apiProvider === 'minimax'
-        ? 'minimax/MiniMax-M2.5'
-        : 'anthropic/claude-sonnet-4-20250514';
+    const providerModelMap: Record<string, string> = {
+      openai: 'openai/gpt-4o',
+      minimax: 'minimax/MiniMax-M2.5',
+      gemini: 'google/gemini-2.5-pro',
+      anthropic: 'anthropic/claude-sonnet-4-20250514',
+    };
+    const desired = providerModelMap[config.apiProvider] || 'anthropic/claude-sonnet-4-20250514';
+
+    // Check if provider has auth in openclaw's auth-profiles
+    const authProfilesPath = path.join(OPENCLAW_CONFIG_DIR, 'agents', 'main', 'agent', 'auth-profiles.json');
+    let hasProviderAuth = false;
+    try {
+      const profiles = JSON.parse(fs.readFileSync(authProfilesPath, 'utf-8'));
+      hasProviderAuth = Object.values(profiles).some(
+        (p: unknown) => (p as Record<string, unknown>).provider === config.apiProvider
+      );
+    } catch { /* no auth profiles */ }
+
+    // Always write the API key to openclaw auth-profiles (updates existing keys too)
+    if (config.apiKey) {
+      try {
+        const dir = path.dirname(authProfilesPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        let profiles: Record<string, unknown> = {};
+        try { profiles = JSON.parse(fs.readFileSync(authProfilesPath, 'utf-8')); } catch { /* new file */ }
+        profiles[`${config.apiProvider}:manual`] = {
+          id: `${config.apiProvider}:manual`,
+          provider: config.apiProvider,
+          token: config.apiKey,
+          createdAtMs: Date.now(),
+        };
+        fs.writeFileSync(authProfilesPath, JSON.stringify(profiles, null, 2) + '\n');
+        hasProviderAuth = true;
+      } catch { /* ignore write errors */ }
+    }
+
+    primary = desired;
   } else {
     primary = 'claude-cli/opus-4.6';
   }
@@ -158,6 +200,40 @@ function generateOpenClawConfig(config: Config): void {
   };
 
   fs.writeFileSync(OPENCLAW_CONFIG_PATH, JSON.stringify(openclawConfig, null, 2) + '\n');
+
+  // Ensure all paired devices have operator.write scope (required for chat.send).
+  // The default openclaw setup/configure flow may omit this scope.
+  ensureDeviceWriteScope();
+}
+
+function ensureDeviceWriteScope(): void {
+  const pairedPath = path.join(OPENCLAW_CONFIG_DIR, 'devices', 'paired.json');
+  if (!fs.existsSync(pairedPath)) return;
+  try {
+    const data = JSON.parse(fs.readFileSync(pairedPath, 'utf-8'));
+    let changed = false;
+    for (const dev of Object.values(data) as Record<string, unknown>[]) {
+      const addScope = (arr: string[] | undefined, scope: string): string[] => {
+        if (!arr) return [scope];
+        if (arr.includes(scope)) return arr;
+        changed = true;
+        return [...arr, scope];
+      };
+      dev.scopes = addScope(dev.scopes as string[], 'operator.write');
+      dev.approvedScopes = addScope(dev.approvedScopes as string[], 'operator.write');
+      const tokens = dev.tokens as Record<string, { scopes: string[] }> | undefined;
+      if (tokens) {
+        for (const tok of Object.values(tokens)) {
+          tok.scopes = addScope(tok.scopes, 'operator.write');
+        }
+      }
+    }
+    if (changed) {
+      fs.writeFileSync(pairedPath, JSON.stringify(data, null, 2) + '\n');
+    }
+  } catch {
+    // Don't block startup if paired.json is malformed
+  }
 }
 
 // ── Binary discovery ───────────────────────────────────────
@@ -1142,81 +1218,95 @@ function broadcastSessions(): void {
 }
 
 let gatewayWsAuthenticated = false;
+let activeDesktopSessionKey: string | null = null;
+
+function getDeviceToken(): string | null {
+  const pairedPath = path.join(OPENCLAW_CONFIG_DIR, 'devices', 'paired.json');
+  try {
+    const data = JSON.parse(fs.readFileSync(pairedPath, 'utf-8'));
+    for (const dev of Object.values(data) as Record<string, unknown>[]) {
+      const tokens = dev.tokens as Record<string, { token: string }> | undefined;
+      if (tokens?.operator?.token) return tokens.operator.token;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
 
 function connectGatewayWs(port: number, token: string): void {
   closeGatewayWs();
   gatewayWsAuthenticated = false;
 
-  const url = `ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`;
+  const url = `ws://127.0.0.1:${port}/ws/client?token=${encodeURIComponent(token)}`;
   const ws = new WebSocket(url);
   gatewayWs = ws;
 
-  let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
-
   ws.addEventListener('open', () => {
-    // Wait for connect.challenge from gateway — timeout after 10s
-    handshakeTimer = setTimeout(() => {
-      if (!gatewayWsAuthenticated) {
-        send('gateway-log', 'Gateway WS handshake timeout — retrying\n');
-        ws.close();
+    console.log('[gatewayWs] connected to', url.replace(/token=[^&]+/, 'token=***'));
+    gatewayWsAuthenticated = true;
+    console.log('[gatewayWs] authenticated (client endpoint)');
+    // Keepalive — use WebSocket-level ping, not JSON
+    const pingTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        // No-op: gateway handles keepalive internally
+      } else {
+        clearInterval(pingTimer);
       }
-    }, 10000);
+    }, 25000);
   });
 
   ws.addEventListener('message', (evt) => {
     try {
       const msg = JSON.parse(String(evt.data));
 
-      // ── Handshake: respond to connect.challenge ──
+      if (msg.type === 'pong') return;
+
+      // Handle challenge if server sends one — respond with gateway token
       if (msg.type === 'event' && msg.event === 'connect.challenge') {
-        // Challenge details omitted to reduce log noise
-        const { nonce, ts } = msg.payload || {};
-        if (!nonce) {
-          send('gateway-log', 'Gateway WS: challenge missing nonce\n');
-          ws.close();
-          return;
-        }
-        const connectReq = {
-          type: 'req',
-          id: 'connect-1',
-          method: 'connect',
+        const { nonce } = msg.payload || {};
+        if (!nonce) { ws.close(); return; }
+        ws.send(JSON.stringify({
+          type: 'req', id: 'connect-1', method: 'connect',
           params: {
-            minProtocol: 3,
-            maxProtocol: 3,
+            minProtocol: 3, maxProtocol: 3,
             client: { id: 'openclaw-macos', version: '1.0.0', platform: 'darwin', mode: 'ui' },
             role: 'operator',
             scopes: ['operator.read', 'operator.write', 'operator.approvals'],
             auth: { token },
           },
-        };
-        // Connect request details omitted to reduce log noise (and avoid leaking token)
-        ws.send(JSON.stringify(connectReq));
+        }));
         return;
       }
-
-      // ── Handshake: hello-ok response ──
       if (msg.type === 'res' && msg.id === 'connect-1') {
-        if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = null; }
-        if (msg.ok) {
-          gatewayWsAuthenticated = true;
-          // Silently mark as connected — no log noise
-        } else {
-          send('gateway-log', `Gateway WS handshake rejected: ${JSON.stringify(msg)}\n`);
-          ws.close();
-        }
+        if (msg.ok) console.log('[gatewayWs] challenge handshake ok');
         return;
       }
 
-      // Skip logging unhandled pre-auth messages to reduce noise
+      // Debug: log all post-auth messages
+      const eventType_ = msg.event || msg.type;
+      console.log('[gatewayWs] msg:', eventType_, 'sid:', (msg.payload || msg).session_id || (msg.payload || msg).sessionId || '(none)');
+      if (eventType_ !== 'health') {
+        console.log('[gatewayWs] FULL:', JSON.stringify(msg).slice(0, 500));
+      }
 
-      // ── Post-handshake: process gateway events ──
-      if (!gatewayWsAuthenticated) return;
+      // Handle error responses from gateway (e.g. scope errors on chat.send)
+      if (msg.type === 'res' && !msg.ok) {
+        const errMsg = msg.error?.message || msg.errorMessage || JSON.stringify(msg.error || 'Unknown error');
+        console.log('[gatewayWs] request error:', msg.id, errMsg);
+        send('chat-event', { type: 'error', payload: { error: errMsg } });
+        return;
+      }
 
       // Gateway events come as { type: "event", event: "...", payload: { ... } }
       // or flat { type: "...", session_id: "..." } depending on protocol version.
       const eventType = msg.event || msg.type;
       const payload = msg.payload || msg;
-      const sid: string = payload.session_id || payload.sessionId || '';
+      let sid: string = payload.session_id || payload.sessionId || payload.sessionKey || '';
+
+      // For events without session IDs, use the active desktop session key
+      if (!sid && activeDesktopSessionKey) {
+        sid = activeDesktopSessionKey;
+        payload.session_id = sid;
+      }
 
       if (!sid && !['stream.delta', 'stream.end'].includes(eventType)) return;
 
@@ -1262,6 +1352,46 @@ function connectGatewayWs(port: number, token: string): void {
         broadcastSessions();
         relayToPhoneClients(msg);
         send('chat-event', { type: eventType, payload });
+      } else if (eventType === 'chat') {
+        relayToPhoneClients(msg);
+        const state = payload.state as string;
+        if (state === 'error') {
+          send('chat-event', { type: 'error', payload: { session_id: sid, error: payload.errorMessage || 'Unknown error' } });
+        } else if (state === 'delta' || state === 'final') {
+          // Extract text from message.content[0].text
+          const message = payload.message as Record<string, unknown> | undefined;
+          const content = (message?.content as Array<Record<string, unknown>>) || [];
+          const textPart = content.find(c => c.type === 'text');
+          if (textPart?.text) {
+            const runId = (payload.runId as string) || 'chat-part';
+            send('chat-event', {
+              type: 'message.part.updated',
+              payload: {
+                session_id: sid,
+                part: { id: runId, type: 'text', text: textPart.text },
+              },
+            });
+          }
+          if (state === 'final') {
+            send('chat-event', { type: 'session.idle', payload: { session_id: sid } });
+            if (sid === activeDesktopSessionKey) activeDesktopSessionKey = null;
+          }
+        }
+      } else if (eventType === 'agent') {
+        relayToPhoneClients(msg);
+        const data = payload.data as Record<string, unknown> | undefined;
+        const stream = payload.stream as string;
+        if (stream === 'lifecycle') {
+          const phase = data?.phase as string;
+          if (phase === 'start') {
+            send('chat-event', { type: 'session.status', payload: { session_id: sid, status: 'busy' } });
+          } else if (phase === 'end') {
+            send('chat-event', { type: 'session.idle', payload: { session_id: sid } });
+            if (sid === activeDesktopSessionKey) activeDesktopSessionKey = null;
+          } else if (phase === 'error') {
+            send('chat-event', { type: 'error', payload: { session_id: sid, error: data?.error || 'Unknown error' } });
+          }
+        }
       } else if (
         eventType === 'stream.delta' ||
         eventType === 'stream.end' ||
@@ -1281,16 +1411,18 @@ function connectGatewayWs(port: number, token: string): void {
     }
   });
 
-  ws.addEventListener('close', () => {
-    if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = null; }
+  ws.addEventListener('close', (e) => {
+    console.log('[gatewayWs] closed, code:', e.code, 'reason:', e.reason, 'wasAuthenticated:', gatewayWsAuthenticated);
     gatewayWs = null;
     gatewayWsAuthenticated = false;
     if (!intentionallyStopping) {
+      console.log('[gatewayWs] will retry in 3s');
       gatewayWsRetryTimer = setTimeout(() => connectGatewayWs(port, token), 3000);
     }
   });
 
-  ws.addEventListener('error', () => {
+  ws.addEventListener('error', (e) => {
+    console.log('[gatewayWs] error:', (e as ErrorEvent).message || 'unknown');
     // close event will fire after this, triggering reconnect
   });
 }
@@ -1343,6 +1475,8 @@ function startServer(): void {
       env.OPENAI_API_KEY = config.apiKey;
     } else if (config.apiProvider === 'minimax') {
       env.MINIMAX_API_KEY = config.apiKey;
+    } else if (config.apiProvider === 'gemini') {
+      env.GEMINI_API_KEY = config.apiKey;
     }
   }
 
@@ -1402,13 +1536,35 @@ function startServer(): void {
     }
   });
 
-  // OpenClaw gateway takes a moment to bind the port
-  setTimeout(() => {
-    if (gatewayProc && !intentionallyStopping) {
-      send('status', 'running');
-      connectGatewayWs(config.port, config.password);
-    }
-  }, 2000);
+  // Wait for gateway to be ready before connecting WS
+  const port = config.port;
+  const password = config.password;
+  let attempts = 0;
+  const maxAttempts = 15;
+  const pollGateway = () => {
+    if (!gatewayProc || intentionallyStopping) return;
+    attempts++;
+    const req = http.get(`http://127.0.0.1:${port}/health`, (res) => {
+      if (res.statusCode === 200) {
+        send('status', 'running');
+        connectGatewayWs(port, password);
+      } else if (attempts < maxAttempts) {
+        setTimeout(pollGateway, 500);
+      }
+      res.resume();
+    });
+    req.on('error', () => {
+      if (attempts < maxAttempts) {
+        setTimeout(pollGateway, 500);
+      } else {
+        // Fallback: try connecting anyway
+        send('status', 'running');
+        connectGatewayWs(port, password);
+      }
+    });
+    req.end();
+  };
+  setTimeout(pollGateway, 1000);
 }
 
 function stopServer(resetClient = true): Promise<void> {
@@ -1463,27 +1619,181 @@ ipcMain.handle('server:stop', () => stopServer());
 
 ipcMain.handle('sessions:list', () => Array.from(sessions.values()));
 
-ipcMain.handle('chat:send', (_, sessionKey: string, message: string, attachments?: { type: string; mimeType: string; fileName: string; content: string }[]) => {
-  if (!gatewayWs || gatewayWs.readyState !== WebSocket.OPEN || !gatewayWsAuthenticated) {
-    send('chat-event', { type: 'error', payload: { error: 'Gateway not connected' } });
-    return;
+ipcMain.handle('sessions:list-persistent', () => {
+  return new Promise((resolve) => {
+    const openclawBin = findBinary('openclaw');
+    if (!openclawBin) { console.log('[sessions:list-persistent] openclaw binary not found'); return resolve([]); }
+    console.log('[sessions:list-persistent] calling:', findNode(), openclawBin);
+    execFile(findNode(), [openclawBin, 'gateway', 'call', 'sessions.list', '--json'], {
+      env: enrichedEnv(),
+      timeout: 15000,
+    }, (err, stdout, stderr) => {
+      if (err) { console.log('[sessions:list-persistent] error:', err.message, stderr); return resolve([]); }
+      console.log('[sessions:list-persistent] raw output length:', stdout.length);
+      try {
+        const raw = JSON.parse(stdout);
+        const list: Record<string, unknown>[] = Array.isArray(raw) ? raw : (raw.sessions || []);
+        const sessionsPath = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'sessions', 'sessions.json');
+        let sessionsData: Record<string, { claudeCliSessionId?: string }> = {};
+        try { sessionsData = JSON.parse(fs.readFileSync(sessionsPath, 'utf-8')); } catch { /* ignore */ }
+        const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+        const projectDirs = fs.existsSync(claudeProjectsDir) ? fs.readdirSync(claudeProjectsDir) : [];
+
+        const result = list.map((s) => {
+          const fullKey = (s.key || '') as string;
+          const shortKey = fullKey.includes(':') ? fullKey.split(':').pop()! : fullKey;
+          const updatedAt = typeof s.updatedAt === 'number' ? s.updatedAt
+            : typeof s.updatedAt === 'string' ? new Date(s.updatedAt as string).getTime() / 1000
+            : Date.now() / 1000;
+
+          // Try to get first user message as title
+          let title = (s.title as string) || shortKey;
+          const entry = sessionsData[shortKey] || sessionsData[fullKey];
+          if (entry?.claudeCliSessionId) {
+            for (const dir of projectDirs) {
+              const candidate = path.join(claudeProjectsDir, dir, `${entry.claudeCliSessionId}.jsonl`);
+              if (!fs.existsSync(candidate)) continue;
+              try {
+                const content = fs.readFileSync(candidate, 'utf-8');
+                for (const line of content.split('\n')) {
+                  if (!line) continue;
+                  const parsed = JSON.parse(line);
+                  if (parsed.type !== 'user') continue;
+                  const rawContent = parsed.message?.content ?? '';
+                  let text = '';
+                  if (Array.isArray(rawContent)) {
+                    text = rawContent.filter((c: { type: string }) => c.type === 'text').map((c: { text: string }) => c.text).join('');
+                  } else if (typeof rawContent === 'string') {
+                    text = rawContent;
+                  }
+                  const trimmed = text.replace(/^\n+|\n+$/g, '');
+                  if (trimmed) title = trimmed.length > 80 ? trimmed.slice(0, 80) + '...' : trimmed;
+                  break;
+                }
+              } catch { /* skip */ }
+              break;
+            }
+          }
+          return { id: shortKey, gatewayKey: fullKey, title, updatedAt };
+        }).sort((a, b) => b.updatedAt - a.updatedAt);
+        console.log('[sessions:list-persistent] returning', result.length, 'sessions');
+        resolve(result);
+      } catch (e) { console.log('[sessions:list-persistent] parse error:', e); resolve([]); }
+    });
+  });
+});
+
+ipcMain.handle('sessions:delete', (_, gatewayKey: string) => {
+  return new Promise((resolve, reject) => {
+    const openclawBin = findBinary('openclaw');
+    if (!openclawBin) return reject(new Error('openclaw not found'));
+    execFile(findNode(), [openclawBin, 'gateway', 'call', 'sessions.delete', '--params', JSON.stringify({ key: gatewayKey }), '--json'], {
+      env: enrichedEnv(),
+      timeout: 15000,
+    }, (err) => {
+      if (err) return reject(err);
+      resolve(true);
+    });
+  });
+});
+
+ipcMain.handle('sessions:load-history', (_, sessionKey: string) => {
+  return new Promise((resolve) => {
+    const sessionsPath = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'sessions', 'sessions.json');
+    let sessionsData: Record<string, { claudeCliSessionId?: string }> = {};
+    try { sessionsData = JSON.parse(fs.readFileSync(sessionsPath, 'utf-8')); } catch { return resolve([]); }
+
+    const entry = sessionsData[sessionKey];
+    if (!entry?.claudeCliSessionId) return resolve([]);
+
+    const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+    const projectDirs = fs.existsSync(claudeProjectsDir) ? fs.readdirSync(claudeProjectsDir) : [];
+
+    for (const dir of projectDirs) {
+      const candidate = path.join(claudeProjectsDir, dir, `${entry.claudeCliSessionId}.jsonl`);
+      if (!fs.existsSync(candidate)) continue;
+      try {
+        const content = fs.readFileSync(candidate, 'utf-8');
+        const messages: { id: string; role: string; content: string; timestamp: number }[] = [];
+        let msgIndex = 0;
+        for (const line of content.split('\n')) {
+          if (!line) continue;
+          const parsed = JSON.parse(line);
+          if (parsed.type !== 'user' && parsed.type !== 'assistant') continue;
+          const rawContent = parsed.message?.content ?? '';
+          let text = '';
+          if (Array.isArray(rawContent)) {
+            text = rawContent.filter((c: { type: string }) => c.type === 'text').map((c: { text: string }) => c.text).join('\n');
+          } else if (typeof rawContent === 'string') {
+            text = rawContent;
+          }
+          messages.push({
+            id: `hist-${msgIndex++}`,
+            role: parsed.type,
+            content: text,
+            timestamp: parsed.timestamp || Date.now(),
+          });
+        }
+        return resolve(messages);
+      } catch { /* skip */ }
+    }
+    resolve([]);
+  });
+});
+
+ipcMain.handle('chat:send', (_, sessionKey: string, message: string, attachments?: { type: string; mimeType: string; fileName: string; content: string }[], fileRefs?: string[]) => {
+  const config = loadConfig();
+  console.log('[chat:send] sessionKey:', sessionKey, 'via HTTP');
+
+  let finalMessage = message;
+  if (fileRefs && fileRefs.length > 0) {
+    const refList = fileRefs.map(fp => `- ${fp}`).join('\n');
+    finalMessage = `[Referenced files — read these as needed using your file tools]\n${refList}\n\n${message}`;
   }
-  const reqId = `chat-${Date.now()}`;
-  const params: Record<string, unknown> = {
-    sessionKey,
-    message,
+
+  const body = JSON.stringify({
     model: 'default',
+    messages: [{ role: 'user', content: finalMessage }],
     stream: true,
-  };
-  if (attachments && attachments.length > 0) {
-    params.attachments = attachments.map(a => ({
-      type: a.type,
-      mimeType: a.mimeType,
-      fileName: a.fileName,
-      content: a.content,
-    }));
-  }
-  gatewayWs.send(JSON.stringify({ type: 'req', id: reqId, method: 'chat.send', params }));
+  }, null, 0);
+
+  const url = `http://127.0.0.1:${config.port}/v1/chat/completions`;
+  console.log('[chat:send] POST', url);
+
+  // Track this session key so WS events without session IDs can be matched
+  activeDesktopSessionKey = sessionKey;
+
+  const req = http.request(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${config.password}`,
+      'Content-Type': 'application/json',
+      'x-openclaw-session-key': sessionKey,
+    },
+  }, (res) => {
+    console.log('[chat:send] response status:', res.statusCode);
+    if (res.statusCode !== 200) {
+      let errBody = '';
+      res.on('data', (chunk: Buffer) => { errBody += chunk.toString(); });
+      res.on('end', () => {
+        console.log('[chat:send] error body:', errBody.slice(0, 300));
+        send('chat-event', { type: 'error', payload: { error: `Gateway error: ${res.statusCode}` } });
+      });
+      return;
+    }
+    // The HTTP endpoint accepts the request; actual streaming comes via WS events.
+    // Just drain the response.
+    res.on('data', () => {});
+    res.on('end', () => {});
+  });
+
+  req.on('error', (err) => {
+    console.log('[chat:send] request error:', err.message);
+    send('chat-event', { type: 'error', payload: { error: `Connection failed: ${err.message}` } });
+  });
+
+  req.write(body);
+  req.end();
 });
 
 ipcMain.handle('chat:abort', (_, sessionKey: string) => {
@@ -1492,7 +1802,7 @@ ipcMain.handle('chat:abort', (_, sessionKey: string) => {
     type: 'req',
     id: `abort-${Date.now()}`,
     method: 'session.abort',
-    params: { sessionId: sessionKey },
+    params: { sessionId: sessionKey, sessionKey },
   }));
 });
 
@@ -1518,6 +1828,37 @@ ipcMain.handle('chat:pick-image', async () => {
   };
 });
 
+ipcMain.handle('chat:pick-file', async () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return null;
+  const config = loadConfig();
+  const activeWs = config.workspaces.find((w) => w.id === config.activeWorkspaceId);
+  const defaultPath = activeWs?.paths[0] ?? undefined;
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openFile', 'multiSelections'],
+    defaultPath,
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  const IMAGE_EXTS: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
+  return result.filePaths.map((fp) => {
+    const ext = path.extname(fp).toLowerCase().slice(1);
+    const mimeType = IMAGE_EXTS[ext];
+    let imageData: { mimeType: string; content: string; dataUrl: string } | undefined;
+    if (mimeType) {
+      try {
+        const buffer = fs.readFileSync(fp);
+        const base64 = buffer.toString('base64');
+        imageData = { mimeType, content: base64, dataUrl: `data:${mimeType};base64,${base64}` };
+      } catch { /* ignore read errors for images */ }
+    }
+    return {
+      path: fp,
+      fileName: path.basename(fp),
+      relativePath: defaultPath ? path.relative(defaultPath, fp) : path.basename(fp),
+      imageData,
+    };
+  });
+});
+
 ipcMain.handle('cli:detect', () => ({
   openclaw: !!findBinary('openclaw'),
   claude: !!findBinary('claude'),
@@ -1530,8 +1871,15 @@ ipcMain.handle('config:set-ai-source', async (_, aiSource: AISource, apiKey?: st
     || (apiKey !== undefined && config.apiKey !== apiKey)
     || (apiProvider !== undefined && config.apiProvider !== apiProvider);
   config.aiSource = aiSource;
-  if (apiKey !== undefined) config.apiKey = apiKey;
   if (apiProvider !== undefined) config.apiProvider = apiProvider;
+  if (apiKey !== undefined && apiKey) {
+    config.apiKey = apiKey;
+    // Store per-provider
+    if (config.apiProvider) config.apiKeys[config.apiProvider] = apiKey;
+  } else if (apiProvider !== undefined) {
+    // Switching provider without new key — load stored key for this provider
+    config.apiKey = config.apiKeys[apiProvider] || '';
+  }
   saveConfig(config);
   if (changed) {
     // Only restart when the config actually changed

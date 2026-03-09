@@ -52,13 +52,6 @@ export default function App() {
     window.api.onConfigChanged(setConfig);
   }, []);
 
-  // Auto-open QR modal when tunnel is connecting or ready, and no phone connected
-  useEffect(() => {
-    if (!clientConnected && (tunnelHealth === 'checking' || tunnelURL)) {
-      setQrModalOpen(true);
-    }
-  }, [tunnelURL, tunnelHealth]);
-
   // Auto-close QR modal when phone connects
   useEffect(() => {
     if (clientConnected && !prevClientConnected.current) {
