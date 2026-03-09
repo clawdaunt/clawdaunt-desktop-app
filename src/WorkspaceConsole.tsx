@@ -42,6 +42,8 @@ export default function WorkspaceConsole({
   const [sidebarTab, setSidebarTab] = useState<'workspaces' | 'sessions'>('workspaces');
   const [expandedWorkspaces, setExpandedWorkspaces] = useState<Set<string>>(new Set());
   const [sessionContextMenu, setSessionContextMenu] = useState<{ x: number; y: number; session: PersistentSession } | null>(null);
+  const [selectedSessions, setSelectedSessions] = useState<Set<string>>(new Set());
+  const [batchDeleting, setBatchDeleting] = useState(false);
 
   // Chat state
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
@@ -186,17 +188,51 @@ export default function WorkspaceConsole({
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages]);
 
-  // Reset chat when active workspace changes
-  useEffect(() => {
-    setChatMessages([]);
-    setChatSessionKey(null);
+  // Reload workspace chat from gateway JSONL
+  const reloadWorkspaceChat = useCallback(() => {
+    const ws = config.workspaces.find(w => w.id === config.activeWorkspaceId);
     setChatInput('');
     setPendingImages([]);
     setPendingFiles([]);
+    setViewingPastSession(false);
     setIsStreaming(false);
     streamAccum.current.clear();
     currentAssistantId.current = null;
+    if (ws?.openclawSessionKey) {
+      setChatSessionKey(ws.openclawSessionKey);
+      window.api.loadSessionHistory(ws.openclawSessionKey)
+        .then(history => setChatMessages(history))
+        .catch(() => setChatMessages([]));
+    } else {
+      setChatMessages([]);
+      setChatSessionKey(null);
+    }
+  }, [config.workspaces, config.activeWorkspaceId]);
+
+  // Load workspace chat when active workspace changes
+  useEffect(() => {
+    const ws = config.workspaces.find(w => w.id === config.activeWorkspaceId);
+    setChatInput('');
+    setPendingImages([]);
+    setPendingFiles([]);
+    setViewingPastSession(false);
+    setIsStreaming(false);
+    streamAccum.current.clear();
+    currentAssistantId.current = null;
+
+    if (!ws?.openclawSessionKey) {
+      setChatMessages([]);
+      setChatSessionKey(null);
+      return;
+    }
+    // Restore the session key so new messages continue the same session
+    setChatSessionKey(ws.openclawSessionKey);
+    // Load history from disk
+    window.api.loadSessionHistory(ws.openclawSessionKey)
+      .then(history => setChatMessages(history))
+      .catch(() => setChatMessages([]));
   }, [config.activeWorkspaceId]);
+
 
   const generateId = () => {
     const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -216,6 +252,10 @@ export default function WorkspaceConsole({
     if (!sessionKey) {
       sessionKey = `desktop:${generateId()}`;
       setChatSessionKey(sessionKey);
+      // Persist session key on the active workspace
+      if (config.activeWorkspaceId) {
+        window.api.setWorkspaceSessionKey(config.activeWorkspaceId, sessionKey).then(onConfigUpdate);
+      }
     }
     console.log('[handleSendMessage] sending with sessionKey:', sessionKey);
 
@@ -279,7 +319,6 @@ export default function WorkspaceConsole({
   };
 
   const handleLoadPastSession = async (session: PersistentSession) => {
-    setChatMessages([]);
     setChatSessionKey(session.id);
     setViewingPastSession(true);
     setIsStreaming(false);
@@ -287,6 +326,7 @@ export default function WorkspaceConsole({
     currentAssistantId.current = null;
     setPendingImages([]);
     setPendingFiles([]);
+    setChatMessages([]);
     try {
       const history = await window.api.loadSessionHistory(session.id);
       setChatMessages(history);
@@ -297,10 +337,39 @@ export default function WorkspaceConsole({
     try {
       await window.api.deleteSession(session.gatewayKey);
       setPastSessions(prev => prev.filter(s => s.id !== session.id));
+      setSelectedSessions(prev => { const next = new Set(prev); next.delete(session.id); return next; });
       // If we're viewing this session, clear the chat
       if (chatSessionKey === session.id) handleNewChat();
     } catch { /* ignore */ }
     setSessionContextMenu(null);
+  };
+
+  const handleBatchDeleteSessions = async () => {
+    if (selectedSessions.size === 0) return;
+    setBatchDeleting(true);
+    const toDelete = pastSessions.filter(s => selectedSessions.has(s.id));
+    await Promise.allSettled(toDelete.map(s => window.api.deleteSession(s.gatewayKey)));
+    setPastSessions(prev => prev.filter(s => !selectedSessions.has(s.id)));
+    if (chatSessionKey && selectedSessions.has(chatSessionKey)) handleNewChat();
+    setSelectedSessions(new Set());
+    setBatchDeleting(false);
+  };
+
+  const toggleSessionSelection = (id: string) => {
+    setSelectedSessions(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAllSessions = () => {
+    if (selectedSessions.size === pastSessions.length) {
+      setSelectedSessions(new Set());
+    } else {
+      setSelectedSessions(new Set(pastSessions.map(s => s.id)));
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -577,32 +646,24 @@ export default function WorkspaceConsole({
 
         <div className="sidebar-tabs">
           <button
+            className={`sidebar-tab${sidebarTab === 'sessions' ? ' active' : ''}`}
+            onClick={() => setSidebarTab('sessions')}
+          >
+            Past Chats
+            {pastSessions.length > 0 && (
+              <span className="sidebar-tab-badge">{pastSessions.length}</span>
+            )}
+          </button>
+          <button
             className={`sidebar-tab${sidebarTab === 'workspaces' ? ' active' : ''}`}
             onClick={() => {
               setSidebarTab('workspaces');
               if (viewingPastSession) {
-                setChatMessages([]);
-                setChatSessionKey(null);
-                setChatInput('');
-                setPendingImages([]);
-                setPendingFiles([]);
-                setIsStreaming(false);
-                setViewingPastSession(false);
-                streamAccum.current.clear();
-                currentAssistantId.current = null;
+                reloadWorkspaceChat();
               }
             }}
           >
             Workspaces
-          </button>
-          <button
-            className={`sidebar-tab${sidebarTab === 'sessions' ? ' active' : ''}`}
-            onClick={() => setSidebarTab('sessions')}
-          >
-            Sessions
-            {pastSessions.length > 0 && (
-              <span className="sidebar-tab-badge">{pastSessions.length}</span>
-            )}
           </button>
         </div>
 
@@ -697,23 +758,55 @@ export default function WorkspaceConsole({
               <span className="sessions-empty-text">No past sessions</span>
             </div>
           ) : (
-            pastSessions.map((s) => (
-              <div
-                key={s.id}
-                className={`ws-session-item past-session${chatSessionKey === s.id ? ' active' : ''}`}
-                onClick={() => handleLoadPastSession(s)}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setSessionContextMenu({ x: e.clientX, y: e.clientY, session: s });
-                }}
-                title={s.title}
-              >
-                <span className="ws-session-dot idle" />
-                <span className="ws-session-title">{s.title}</span>
-                <span className="ws-session-time">{formatTimeAgo(s.updatedAt)}</span>
-              </div>
-            ))
+            <>
+              {pastSessions.length > 1 && (
+                <div className="sessions-batch-bar">
+                  <label className="session-checkbox-label" onClick={(e) => e.stopPropagation()}>
+                    <input
+                      type="checkbox"
+                      checked={selectedSessions.size === pastSessions.length}
+                      onChange={toggleSelectAllSessions}
+                    />
+                    <span className="session-select-text">
+                      {selectedSessions.size > 0 ? `${selectedSessions.size} selected` : 'Select all'}
+                    </span>
+                  </label>
+                  {selectedSessions.size > 0 && (
+                    <button
+                      className="sessions-batch-delete-btn"
+                      onClick={handleBatchDeleteSessions}
+                      disabled={batchDeleting}
+                    >
+                      {batchDeleting ? 'Deleting...' : `Delete (${selectedSessions.size})`}
+                    </button>
+                  )}
+                </div>
+              )}
+              {pastSessions.map((s) => (
+                <div
+                  key={s.id}
+                  className={`ws-session-item past-session${chatSessionKey === s.id ? ' active' : ''}${selectedSessions.has(s.id) ? ' selected' : ''}`}
+                  onClick={() => handleLoadPastSession(s)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setSessionContextMenu({ x: e.clientX, y: e.clientY, session: s });
+                  }}
+                  title={s.title}
+                >
+                  <input
+                    type="checkbox"
+                    className="session-checkbox"
+                    checked={selectedSessions.has(s.id)}
+                    onChange={() => toggleSessionSelection(s.id)}
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                  <span className="ws-session-dot idle" />
+                  <span className="ws-session-title">{s.title}</span>
+                  <span className="ws-session-time">{formatTimeAgo(s.updatedAt)}</span>
+                </div>
+              ))}
+            </>
           )}
         </div>
         )}
@@ -1076,6 +1169,11 @@ export default function WorkspaceConsole({
           <div className="context-menu-item danger" onClick={() => handleDeletePastSession(sessionContextMenu.session)}>
             Delete
           </div>
+          {selectedSessions.size > 1 && (
+            <div className="context-menu-item danger" onClick={handleBatchDeleteSessions}>
+              Delete Selected ({selectedSessions.size})
+            </div>
+          )}
         </div>
       )}
 

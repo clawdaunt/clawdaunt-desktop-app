@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld('api', {
   deleteWorkspace: (id: string) => ipcRenderer.invoke('workspace:delete', id),
   setActiveWorkspace: (id: string) => ipcRenderer.invoke('workspace:set-active', id),
   addProtectedPath: (workspaceId: string) => ipcRenderer.invoke('workspace:add-protected', workspaceId),
+  setWorkspaceSessionKey: (workspaceId: string, sessionKey: string) =>
+    ipcRenderer.invoke('workspace:set-session-key', workspaceId, sessionKey),
   removeProtectedPath: (workspaceId: string, protectedPath: string) =>
     ipcRenderer.invoke('workspace:remove-protected', workspaceId, protectedPath),
 

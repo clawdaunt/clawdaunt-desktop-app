@@ -8,6 +8,7 @@ interface Workspace {
   name: string;
   paths: string[];
   protected: string[];
+  openclawSessionKey?: string;  // maps to desktop:{random} key used with gateway
 }
 
 interface Config {
@@ -57,6 +58,7 @@ interface ElectronAPI {
   setActiveWorkspace: (id: string) => Promise<Config>;
   addProtectedPath: (workspaceId: string) => Promise<Config>;
   removeProtectedPath: (workspaceId: string, protectedPath: string) => Promise<Config>;
+  setWorkspaceSessionKey: (workspaceId: string, sessionKey: string) => Promise<Config>;
 
   getTunnelURL: () => Promise<string>;
   getTunnelHealth: () => Promise<string>;

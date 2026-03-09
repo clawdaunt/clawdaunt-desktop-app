@@ -1634,7 +1634,7 @@ ipcMain.handle('sessions:list-persistent', () => {
         const raw = JSON.parse(stdout);
         const list: Record<string, unknown>[] = Array.isArray(raw) ? raw : (raw.sessions || []);
         const sessionsPath = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'sessions', 'sessions.json');
-        let sessionsData: Record<string, { claudeCliSessionId?: string }> = {};
+        let sessionsData: Record<string, { sessionId?: string; claudeCliSessionId?: string }> = {};
         try { sessionsData = JSON.parse(fs.readFileSync(sessionsPath, 'utf-8')); } catch { /* ignore */ }
         const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
         const projectDirs = fs.existsSync(claudeProjectsDir) ? fs.readdirSync(claudeProjectsDir) : [];
@@ -1648,7 +1648,24 @@ ipcMain.handle('sessions:list-persistent', () => {
 
           // Try to get first user message as title
           let title = (s.title as string) || shortKey;
-          const entry = sessionsData[shortKey] || sessionsData[fullKey];
+          // sessions.json uses keys like "desktop:abc123" while gateway uses "agent:main:desktop:abc123"
+          const strippedKey = fullKey.replace(/^agent:main:/, '');
+          const entry = sessionsData[strippedKey] || sessionsData[shortKey] || sessionsData[fullKey];
+          // Helper to extract first user message text as title
+          const extractTitleFromContent = (rawContent: unknown): string => {
+            let text = '';
+            if (Array.isArray(rawContent)) {
+              text = rawContent.filter((c: { type: string }) => c.type === 'text').map((c: { text: string }) => c.text).join('');
+            } else if (typeof rawContent === 'string') {
+              text = rawContent;
+            }
+            const trimmed = text.replace(/^\n+|\n+$/g, '');
+            return trimmed.length > 80 ? trimmed.slice(0, 80) + '...' : trimmed;
+          };
+
+          let titleFound = false;
+
+          // Try claude CLI session logs first
           if (entry?.claudeCliSessionId) {
             for (const dir of projectDirs) {
               const candidate = path.join(claudeProjectsDir, dir, `${entry.claudeCliSessionId}.jsonl`);
@@ -1659,19 +1676,30 @@ ipcMain.handle('sessions:list-persistent', () => {
                   if (!line) continue;
                   const parsed = JSON.parse(line);
                   if (parsed.type !== 'user') continue;
-                  const rawContent = parsed.message?.content ?? '';
-                  let text = '';
-                  if (Array.isArray(rawContent)) {
-                    text = rawContent.filter((c: { type: string }) => c.type === 'text').map((c: { text: string }) => c.text).join('');
-                  } else if (typeof rawContent === 'string') {
-                    text = rawContent;
-                  }
-                  const trimmed = text.replace(/^\n+|\n+$/g, '');
-                  if (trimmed) title = trimmed.length > 80 ? trimmed.slice(0, 80) + '...' : trimmed;
+                  const extracted = extractTitleFromContent(parsed.message?.content ?? '');
+                  if (extracted) { title = extracted; titleFound = true; }
                   break;
                 }
               } catch { /* skip */ }
               break;
+            }
+          }
+
+          // Fallback: try gateway session JSONL
+          if (!titleFound && entry?.sessionId) {
+            const gwFile = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'sessions', `${entry.sessionId}.jsonl`);
+            if (fs.existsSync(gwFile)) {
+              try {
+                const content = fs.readFileSync(gwFile, 'utf-8');
+                for (const line of content.split('\n')) {
+                  if (!line) continue;
+                  const parsed = JSON.parse(line);
+                  if (parsed.type !== 'message' || parsed.message?.role !== 'user') continue;
+                  const extracted = extractTitleFromContent(parsed.message?.content ?? '');
+                  if (extracted) { title = extracted; }
+                  break;
+                }
+              } catch { /* skip */ }
             }
           }
           return { id: shortKey, gatewayKey: fullKey, title, updatedAt };
@@ -1687,7 +1715,8 @@ ipcMain.handle('sessions:delete', (_, gatewayKey: string) => {
   return new Promise((resolve, reject) => {
     const openclawBin = findBinary('openclaw');
     if (!openclawBin) return reject(new Error('openclaw not found'));
-    execFile(findNode(), [openclawBin, 'gateway', 'call', 'sessions.delete', '--params', JSON.stringify({ key: gatewayKey }), '--json'], {
+    const shortKey = gatewayKey.replace(/^agent:main:/, '');
+    execFile(findNode(), [openclawBin, 'gateway', 'call', 'sessions.delete', '--params', JSON.stringify({ key: shortKey }), '--json'], {
       env: enrichedEnv(),
       timeout: 15000,
     }, (err) => {
@@ -1697,46 +1726,119 @@ ipcMain.handle('sessions:delete', (_, gatewayKey: string) => {
   });
 });
 
+// Helper to extract text from message content (array or string)
+function extractMessageText(rawContent: unknown): string {
+  if (Array.isArray(rawContent)) {
+    return rawContent.filter((c: { type: string }) => c.type === 'text').map((c: { text: string }) => c.text).join('\n');
+  } else if (typeof rawContent === 'string') {
+    return rawContent;
+  }
+  return '';
+}
+
+// Parse gateway JSONL (type:"message" with message.role)
+function parseGatewayJSONL(content: string): { id: string; role: string; content: string; timestamp: number }[] {
+  const messages: { id: string; role: string; content: string; timestamp: number }[] = [];
+  let msgIndex = 0;
+  for (const line of content.split('\n')) {
+    if (!line) continue;
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed.type !== 'message') continue;
+      const role = parsed.message?.role;
+      if (role !== 'user' && role !== 'assistant') continue;
+      const text = extractMessageText(parsed.message?.content ?? '');
+      if (!text) continue;
+      messages.push({
+        id: `hist-${msgIndex++}`,
+        role,
+        content: text,
+        timestamp: parsed.timestamp ? new Date(parsed.timestamp).getTime() : Date.now(),
+      });
+    } catch { /* skip malformed lines */ }
+  }
+  return messages;
+}
+
 ipcMain.handle('sessions:load-history', (_, sessionKey: string) => {
   return new Promise((resolve) => {
-    const sessionsPath = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'sessions', 'sessions.json');
-    let sessionsData: Record<string, { claudeCliSessionId?: string }> = {};
-    try { sessionsData = JSON.parse(fs.readFileSync(sessionsPath, 'utf-8')); } catch { return resolve([]); }
+    const sessionsDir = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'sessions');
+    const sessionsPath = path.join(sessionsDir, 'sessions.json');
+    let sessionsData: Record<string, { sessionId?: string; claudeCliSessionId?: string }> = {};
+    try { sessionsData = JSON.parse(fs.readFileSync(sessionsPath, 'utf-8')); } catch { /* ok */ }
 
-    const entry = sessionsData[sessionKey];
-    if (!entry?.claudeCliSessionId) return resolve([]);
+    // Try multiple key formats: exact, with desktop: prefix, with agent:main: prefix
+    const entry = sessionsData[sessionKey]
+      || sessionsData[`desktop:${sessionKey}`]
+      || sessionsData[`agent:main:${sessionKey}`];
 
-    const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
-    const projectDirs = fs.existsSync(claudeProjectsDir) ? fs.readdirSync(claudeProjectsDir) : [];
-
-    for (const dir of projectDirs) {
-      const candidate = path.join(claudeProjectsDir, dir, `${entry.claudeCliSessionId}.jsonl`);
-      if (!fs.existsSync(candidate)) continue;
-      try {
-        const content = fs.readFileSync(candidate, 'utf-8');
-        const messages: { id: string; role: string; content: string; timestamp: number }[] = [];
-        let msgIndex = 0;
-        for (const line of content.split('\n')) {
-          if (!line) continue;
-          const parsed = JSON.parse(line);
-          if (parsed.type !== 'user' && parsed.type !== 'assistant') continue;
-          const rawContent = parsed.message?.content ?? '';
-          let text = '';
-          if (Array.isArray(rawContent)) {
-            text = rawContent.filter((c: { type: string }) => c.type === 'text').map((c: { text: string }) => c.text).join('\n');
-          } else if (typeof rawContent === 'string') {
-            text = rawContent;
+    // 1. Try claude CLI session logs (if entry has claudeCliSessionId)
+    if (entry?.claudeCliSessionId) {
+      const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+      const projectDirs = fs.existsSync(claudeProjectsDir) ? fs.readdirSync(claudeProjectsDir) : [];
+      for (const dir of projectDirs) {
+        const candidate = path.join(claudeProjectsDir, dir, `${entry.claudeCliSessionId}.jsonl`);
+        if (!fs.existsSync(candidate)) continue;
+        try {
+          const content = fs.readFileSync(candidate, 'utf-8');
+          const messages: { id: string; role: string; content: string; timestamp: number }[] = [];
+          let msgIndex = 0;
+          for (const line of content.split('\n')) {
+            if (!line) continue;
+            const parsed = JSON.parse(line);
+            if (parsed.type !== 'user' && parsed.type !== 'assistant') continue;
+            const text = extractMessageText(parsed.message?.content ?? '');
+            messages.push({
+              id: `hist-${msgIndex++}`,
+              role: parsed.type,
+              content: text,
+              timestamp: parsed.timestamp || Date.now(),
+            });
           }
-          messages.push({
-            id: `hist-${msgIndex++}`,
-            role: parsed.type,
-            content: text,
-            timestamp: parsed.timestamp || Date.now(),
-          });
-        }
-        return resolve(messages);
-      } catch { /* skip */ }
+          if (messages.length > 0) return resolve(messages);
+        } catch { /* skip */ }
+      }
     }
+
+    // 2. Try gateway JSONL via sessionId from sessions.json
+    if (entry?.sessionId) {
+      const gwFile = path.join(sessionsDir, `${entry.sessionId}.jsonl`);
+      if (fs.existsSync(gwFile)) {
+        try {
+          const messages = parseGatewayJSONL(fs.readFileSync(gwFile, 'utf-8'));
+          if (messages.length > 0) return resolve(messages);
+        } catch { /* skip */ }
+      }
+    }
+
+    // 3. Last resort: scan all gateway JSONL files for one whose session header matches the key
+    //    (handles case where sessions.json doesn't have the entry yet)
+    try {
+      const files = fs.readdirSync(sessionsDir).filter(f => f.endsWith('.jsonl'));
+      for (const file of files) {
+        const filePath = path.join(sessionsDir, file);
+        try {
+          const content = fs.readFileSync(filePath, 'utf-8');
+          const firstLine = content.split('\n')[0];
+          if (!firstLine) continue;
+          const header = JSON.parse(firstLine);
+          // Check if this file's session was created for our session key
+          // The session key appears in sessions.json mapping, but we can also check
+          // if the sessions.json has this sessionId mapped to our key
+          if (header.type === 'session') {
+            const fileSessionId = header.id || file.replace('.jsonl', '');
+            // Check if any key in sessions.json with this sessionId matches our sessionKey
+            for (const [k, v] of Object.entries(sessionsData)) {
+              if (v.sessionId === fileSessionId && (k === sessionKey || k === `desktop:${sessionKey}` || k.endsWith(`:${sessionKey}`))) {
+                const messages = parseGatewayJSONL(content);
+                if (messages.length > 0) return resolve(messages);
+              }
+            }
+          }
+        } catch { /* skip */ }
+      }
+    } catch { /* skip */ }
+
     resolve([]);
   });
 });
@@ -1993,6 +2095,15 @@ ipcMain.handle('workspace:remove-protected', (_, workspaceId: string, protectedP
   const ws = config.workspaces.find((w) => w.id === workspaceId);
   if (!ws) return config;
   ws.protected = ws.protected.filter((p) => p !== protectedPath);
+  saveConfig(config);
+  return config;
+});
+
+ipcMain.handle('workspace:set-session-key', (_, workspaceId: string, sessionKey: string) => {
+  const config = loadConfig();
+  const ws = config.workspaces.find((w) => w.id === workspaceId);
+  if (!ws) return config;
+  ws.openclawSessionKey = sessionKey;
   saveConfig(config);
   return config;
 });
