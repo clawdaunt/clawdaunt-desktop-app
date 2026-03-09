@@ -839,6 +839,51 @@ body {
   line-height: 1.6;
 }
 
+.welcome-subtext {
+  font-size: 13px;
+  color: var(--text-tertiary);
+  max-width: 360px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.welcome-subtext strong {
+  color: var(--text-secondary);
+}
+
+.setup-provider-btn {
+  margin-top: 4px;
+  padding: 8px 20px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--bg-pure);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.setup-provider-btn:hover {
+  background: var(--surface);
+  border-color: var(--text-tertiary);
+}
+
+.chat-no-provider-banner {
+  padding: 10px 16px;
+  background: var(--surface);
+  color: var(--text-tertiary);
+  font-size: 13px;
+  text-align: center;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+.chat-no-provider-banner:hover {
+  color: var(--accent);
+}
+
 .welcome-status {
   display: flex;
   align-items: center;

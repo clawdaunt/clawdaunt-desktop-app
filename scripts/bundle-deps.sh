@@ -122,6 +122,11 @@ else
     cp -R "$PKG_DIR/node_modules" "$BIN_DIR/node_modules"
     echo "[ok] Copied node_modules/"
 
+    # Copy package.json (needed for "type": "module" — without it Node
+    # treats the openclaw ESM entry script as CommonJS and crashes)
+    cp "$PKG_DIR/package.json" "$BIN_DIR/package.json"
+    echo "[ok] Copied package.json"
+
     echo "[ok] openclaw bundled"
   else
     echo "[!!] openclaw not found and could not be installed."

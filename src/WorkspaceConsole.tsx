@@ -39,7 +39,7 @@ export default function WorkspaceConsole({
   const [sessions, setSessions] = useState<GatewaySession[]>([]);
   const [pastSessions, setPastSessions] = useState<PersistentSession[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [sidebarTab, setSidebarTab] = useState<'workspaces' | 'sessions'>('workspaces');
+  const [sidebarTab, setSidebarTab] = useState<'workspaces' | 'sessions'>('sessions');
   const [expandedWorkspaces, setExpandedWorkspaces] = useState<Set<string>>(new Set());
   const [sessionContextMenu, setSessionContextMenu] = useState<{ x: number; y: number; session: PersistentSession } | null>(null);
   const [selectedSessions, setSelectedSessions] = useState<Set<string>>(new Set());
@@ -580,6 +580,9 @@ export default function WorkspaceConsole({
   const currentProviderId = config.aiSource === 'api-key' ? config.apiProvider : config.aiSource;
   const currentProvider = PROVIDERS.find(p => p.id === currentProviderId) || PROVIDERS[0];
 
+  // True when no CLI is installed and no API key is configured
+  const hasNoProvider = !cliStatus.claude && !cliStatus.codex && !config.apiKey;
+
   const activeWs = config.workspaces.find((w) => w.id === config.activeWorkspaceId) ?? null;
 
   // Group sessions by workspace
@@ -923,12 +926,12 @@ export default function WorkspaceConsole({
             </div>
           </div>
           {chatMessages.length > 0 && (
-            <button className="new-chat-btn" onClick={handleNewChat}>
+            <button className="new-chat-btn" onClick={sidebarTab === 'workspaces' ? handleCreateWorkspace : handleNewChat}>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <line x1="12" y1="5" x2="12" y2="19" />
                 <line x1="5" y1="12" x2="19" y2="12" />
               </svg>
-              New chat
+              {sidebarTab === 'workspaces' ? 'New workspace' : 'New chat'}
             </button>
           )}
         </div>
@@ -946,15 +949,28 @@ export default function WorkspaceConsole({
           ) : chatMessages.length === 0 ? (
             <div className="chat-empty-state">
               <div className="welcome-logo">clawdaunt<span>.</span></div>
-              <p className="welcome-text">
-                What can I help you with?
-              </p>
-              <div className="welcome-status">
-                <span className={`connection-dot ${connectionClass}`} />
-                {connectionLabel}
-                {tunnelHealth === 'healthy' && ' — Tunnel active'}
-                {tunnelHealth === 'checking' && ' — Connecting...'}
-              </div>
+              {hasNoProvider ? (
+                <>
+                  <p className="welcome-text" style={{ color: 'var(--accent)' }}>
+                    Set up at least one AI provider in settings to continue.
+                  </p>
+                  <button className="setup-provider-btn" onClick={() => setSettingsOpen(true)}>
+                    Open Settings
+                  </button>
+                </>
+              ) : (
+                <>
+                  <p className="welcome-text">
+                    What can I help you with?
+                  </p>
+                  <div className="welcome-status">
+                    <span className={`connection-dot ${connectionClass}`} />
+                    {connectionLabel}
+                    {tunnelHealth === 'healthy' && ' — Tunnel active'}
+                    {tunnelHealth === 'checking' && ' — Connecting...'}
+                  </div>
+                </>
+              )}
             </div>
           ) : (
             <div className="chat-messages">
@@ -1011,7 +1027,14 @@ export default function WorkspaceConsole({
           )}
 
           {/* Chat input */}
-          {activeWs && (
+          {activeWs && hasNoProvider && (
+            <div className="chat-input-area">
+              <div className="chat-no-provider-banner" onClick={() => setSettingsOpen(true)}>
+                No AI provider configured — click here to open settings
+              </div>
+            </div>
+          )}
+          {activeWs && !hasNoProvider && (
             <div
               className={`chat-input-area${isDragging ? ' dragging' : ''}`}
               onDragOver={handleDragOver}

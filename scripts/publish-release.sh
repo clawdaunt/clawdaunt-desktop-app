@@ -11,6 +11,8 @@ TAG="v$VERSION"
 PRODUCT_NAME="$(node -p "require('./package.json').productName")"
 
 echo "=== Building $PRODUCT_NAME $TAG ==="
+# Clean bundled deps so bundle-deps.sh fetches fresh copies
+rm -rf resources/bin
 npm run make
 
 # Find the built DMG
