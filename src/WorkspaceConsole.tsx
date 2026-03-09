@@ -283,12 +283,12 @@ export default function WorkspaceConsole({
     setPendingFiles([]);
     setIsStreaming(true);
 
-    const filePaths = files.filter(f => f.path).map(f => f.path);
+    const filePaths = files.map(f => f.path).filter(Boolean);
     await window.api.sendChatMessage(
       sessionKey,
       text || (images.length > 0 ? '(image attached)' : '(files attached)'),
-      images.length > 0 ? images : undefined,
-      filePaths.length > 0 ? filePaths : undefined,
+      images.length > 0 ? images : [],
+      filePaths.length > 0 ? filePaths : [],
     );
   };
 
@@ -379,41 +379,47 @@ export default function WorkspaceConsole({
     }
   };
 
-  const handleAddAttachment = () => {
-    fileInputRef.current?.click();
+  const handleAddAttachment = async () => {
+    // Use pickFile IPC to get absolute paths (File.path unavailable with contextIsolation)
+    const refs = await window.api.pickFile();
+    if (!refs) return;
+    refs.forEach(ref => {
+      if (ref.imageData) {
+        setPendingImages(prev => [...prev, {
+          type: 'image',
+          mimeType: ref.imageData!.mimeType,
+          fileName: ref.fileName,
+          content: ref.imageData!.content,
+          dataUrl: ref.imageData!.dataUrl,
+        }]);
+      } else {
+        setPendingFiles(prev => {
+          if (prev.some(f => f.path === ref.path)) return prev;
+          return [...prev, ref];
+        });
+      }
+    });
   };
 
   const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    // File input kept for image paste/drag — non-images should use handleAddAttachment
     const files = e.target.files;
     if (!files) return;
-    const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
     Array.from(files).forEach(file => {
-      const filePath = (file as File & { path?: string }).path || '';
-      if (IMAGE_TYPES.has(file.type)) {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const dataUrl = reader.result as string;
-          const base64 = dataUrl.split(',')[1];
-          setPendingImages(prev => [...prev, {
-            type: 'image',
-            mimeType: file.type,
-            fileName: file.name,
-            content: base64,
-            dataUrl,
-          }]);
-        };
-        reader.readAsDataURL(file);
-      } else {
-        setPendingFiles(prev => {
-          const key = filePath || file.name;
-          if (prev.some(f => (f.path || f.fileName) === key)) return prev;
-          return [...prev, {
-            path: filePath,
-            fileName: file.name,
-            relativePath: file.name,
-          }];
-        });
-      }
+      if (!file.type.startsWith('image/')) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        const base64 = dataUrl.split(',')[1];
+        setPendingImages(prev => [...prev, {
+          type: 'image',
+          mimeType: file.type,
+          fileName: file.name,
+          content: base64,
+          dataUrl,
+        }]);
+      };
+      reader.readAsDataURL(file);
     });
     e.target.value = '';
   };

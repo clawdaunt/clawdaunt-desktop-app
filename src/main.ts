@@ -26,6 +26,7 @@ interface Workspace {
   name: string;
   paths: string[];       // single-element array for now, multi-repo ready
   protected: string[];   // absolute paths AI cannot access
+  openclawSessionKey?: string;  // maps to desktop:{random} key used with gateway
 }
 
 type AISource = 'claude-cli' | 'codex-cli' | 'api-key';
@@ -294,6 +295,24 @@ function findNode(): string {
   const bundled = path.join(bundledBinDir(), 'node');
   if (fs.existsSync(bundled)) return bundled;
   return 'node';
+}
+
+/**
+ * Returns the right node binary to run a given CLI binary.
+ * System-installed CLIs (openclaw, claude, codex) have native addons compiled
+ * against the system Node, so we must use system node to run them.
+ * Bundled binaries use the bundled node.
+ */
+function findNodeFor(binaryPath: string): string {
+  const bundled = bundledBinDir();
+  if (binaryPath.startsWith(bundled)) return findNode();
+  // Binary is system-installed — prefer system node so native addons match,
+  // but fall back to bundled node if no system node is available.
+  for (const dir of SEARCH_PATHS) {
+    const full = path.join(dir, 'node');
+    if (fs.existsSync(full)) return full;
+  }
+  return findNode();
 }
 
 function enrichedEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
@@ -844,7 +863,7 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
         return;
       }
       const sessionKey = decodeURIComponent(keyMatch![1]);
-      execFile(findNode(), [openclawBin, 'gateway', 'call', 'sessions.delete', '--params', JSON.stringify({ key: sessionKey }), '--json'], {
+      execFile(findNodeFor(openclawBin), [openclawBin, 'gateway', 'call', 'sessions.delete', '--params', JSON.stringify({ key: sessionKey }), '--json'], {
         env: enrichedEnv(),
         timeout: 15000,
       }, (err, stdout, stderr) => {
@@ -872,7 +891,7 @@ function startProxyServer(targetPort: number, proxyPort: number): void {
         res.end(JSON.stringify({ error: 'openclaw binary not found' }));
         return;
       }
-      execFile(findNode(), [openclawBin, 'gateway', 'call', 'sessions.list', '--json'], {
+      execFile(findNodeFor(openclawBin), [openclawBin, 'gateway', 'call', 'sessions.list', '--json'], {
         env: enrichedEnv(),
         timeout: 15000,
       }, (err, stdout, stderr) => {
@@ -1480,7 +1499,7 @@ function startServer(): void {
     }
   }
 
-  gatewayProc = spawn(findNode(), [
+  gatewayProc = spawn(findNodeFor(openclawBin), [
     openclawBin,
     'gateway',
     '--port', String(config.port),
@@ -1623,8 +1642,8 @@ ipcMain.handle('sessions:list-persistent', () => {
   return new Promise((resolve) => {
     const openclawBin = findBinary('openclaw');
     if (!openclawBin) { console.log('[sessions:list-persistent] openclaw binary not found'); return resolve([]); }
-    console.log('[sessions:list-persistent] calling:', findNode(), openclawBin);
-    execFile(findNode(), [openclawBin, 'gateway', 'call', 'sessions.list', '--json'], {
+    console.log('[sessions:list-persistent] calling:', findNodeFor(openclawBin), openclawBin);
+    execFile(findNodeFor(openclawBin), [openclawBin, 'gateway', 'call', 'sessions.list', '--json'], {
       env: enrichedEnv(),
       timeout: 15000,
     }, (err, stdout, stderr) => {
@@ -1716,7 +1735,7 @@ ipcMain.handle('sessions:delete', (_, gatewayKey: string) => {
     const openclawBin = findBinary('openclaw');
     if (!openclawBin) return reject(new Error('openclaw not found'));
     const shortKey = gatewayKey.replace(/^agent:main:/, '');
-    execFile(findNode(), [openclawBin, 'gateway', 'call', 'sessions.delete', '--params', JSON.stringify({ key: shortKey }), '--json'], {
+    execFile(findNodeFor(openclawBin), [openclawBin, 'gateway', 'call', 'sessions.delete', '--params', JSON.stringify({ key: shortKey }), '--json'], {
       env: enrichedEnv(),
       timeout: 15000,
     }, (err) => {
@@ -1845,12 +1864,12 @@ ipcMain.handle('sessions:load-history', (_, sessionKey: string) => {
 
 ipcMain.handle('chat:send', (_, sessionKey: string, message: string, attachments?: { type: string; mimeType: string; fileName: string; content: string }[], fileRefs?: string[]) => {
   const config = loadConfig();
-  console.log('[chat:send] sessionKey:', sessionKey, 'via HTTP');
+  console.log('[chat:send] sessionKey:', sessionKey, 'via HTTP', 'fileRefs:', fileRefs, 'attachments:', attachments?.length);
 
   let finalMessage = message;
   if (fileRefs && fileRefs.length > 0) {
     const refList = fileRefs.map(fp => `- ${fp}`).join('\n');
-    finalMessage = `[Referenced files — read these as needed using your file tools]\n${refList}\n\n${message}`;
+    finalMessage = `Referenced files:\n${refList}\n\n${message}`;
   }
 
   const body = JSON.stringify({
