@@ -25,7 +25,7 @@ if (process.platform === 'win32') {
   makers.push(
     new MakerSquirrel({
       name: 'Clawdaunt',
-      setupIcon: 'resources/icon.ico',
+      setupIcon: 'resources/icon.ico', // TODO: create icon.ico for Windows builds
     }),
     new MakerZIP({}, ['win32']),
   );
