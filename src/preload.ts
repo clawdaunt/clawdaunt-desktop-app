@@ -79,4 +79,13 @@ contextBridge.exposeInMainWorld('api', {
   offChatEvent: () => {
     ipcRenderer.removeAllListeners('chat-event');
   },
+
+  getOpenclawUpdateInfo: () => ipcRenderer.invoke('openclaw:update-info'),
+  updateOpenclaw: () => ipcRenderer.invoke('openclaw:update'),
+  onOpenclawUpdate: (cb: (info: { systemVersion: string; bundledVersion: string } | null) => void) => {
+    ipcRenderer.on('openclaw-update', (_, info) => cb(info));
+  },
+  onOpenclawUpdateProgress: (cb: (progress: { status: string; log?: string; error?: string; newVersion?: string }) => void) => {
+    ipcRenderer.on('openclaw-update-progress', (_, progress) => cb(progress));
+  },
 });

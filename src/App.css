@@ -1962,3 +1962,111 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(0, 0, 0, 0.14);
 }
+
+/* ── Update Banner ────────────────────────────── */
+
+.update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  background: #fef3c7;
+  border-bottom: 1px solid #fcd34d;
+  font-size: 13px;
+  color: #92400e;
+  animation: slideDown 0.2s ease;
+}
+
+.update-banner-error {
+  background: #fee2e2;
+  border-bottom-color: #fca5a5;
+  color: #991b1b;
+}
+
+.update-banner-done {
+  background: #dcfce7;
+  border-bottom-color: #86efac;
+  color: #166534;
+}
+
+.update-banner-text {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.update-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.update-btn {
+  padding: 4px 12px;
+  border-radius: 6px;
+  border: 1px solid #d97706;
+  background: #fbbf24;
+  color: #78350f;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition);
+  white-space: nowrap;
+}
+
+.update-btn:hover {
+  background: #f59e0b;
+}
+
+.update-banner-error .update-btn {
+  border-color: #dc2626;
+  background: #fca5a5;
+  color: #7f1d1d;
+}
+
+.update-banner-error .update-btn:hover {
+  background: #f87171;
+}
+
+.update-dismiss {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: inherit;
+  opacity: 0.6;
+  border-radius: 4px;
+  transition: opacity var(--transition), background var(--transition);
+}
+
+.update-dismiss:hover {
+  opacity: 1;
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.update-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid #d97706;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes slideDown {
+  from { transform: translateY(-100%); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
