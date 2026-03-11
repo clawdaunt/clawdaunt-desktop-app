@@ -86,6 +86,11 @@ interface ElectronAPI {
   pickFile: () => Promise<FileReference[] | null>;
   onChatEvent: (cb: (event: ChatEvent) => void) => void;
   offChatEvent: () => void;
+
+  getOpenclawUpdateInfo: () => Promise<OpenclawUpdateInfo | null>;
+  updateOpenclaw: () => Promise<{ success: boolean; error?: string; newVersion?: string }>;
+  onOpenclawUpdate: (cb: (info: OpenclawUpdateInfo | null) => void) => void;
+  onOpenclawUpdateProgress: (cb: (progress: OpenclawUpdateProgress) => void) => void;
 }
 
 interface ChatEvent {
@@ -125,6 +130,18 @@ interface ChatMessage {
   files?: FileReference[];
   toolEvents?: ToolEvent[];
   timestamp: number;
+}
+
+interface OpenclawUpdateInfo {
+  systemVersion: string;
+  bundledVersion: string;
+}
+
+interface OpenclawUpdateProgress {
+  status: 'updating' | 'done' | 'error';
+  log?: string;
+  error?: string;
+  newVersion?: string;
 }
 
 interface Window {

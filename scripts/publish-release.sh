@@ -11,8 +11,8 @@ TAG="v$VERSION"
 PRODUCT_NAME="$(node -p "require('./package.json').productName")"
 
 echo "=== Building $PRODUCT_NAME $TAG ==="
-# Clean bundled deps so bundle-deps.sh fetches fresh copies
-rm -rf resources/bin
+# Clean previous build artifacts and bundled deps
+rm -rf out resources/bin
 npm run make
 
 # Find the built DMG
@@ -22,6 +22,14 @@ if [ -z "$DMG_PATH" ]; then
   exit 1
 fi
 echo "[ok] Built: $DMG_PATH"
+
+# Find the built ZIP (required for auto-updates on macOS)
+ZIP_PATH="$(find out/make -name '*.zip' -type f | head -1)"
+if [ -z "$ZIP_PATH" ]; then
+  echo "[!!] No ZIP found in out/make/. Auto-updates won't work without it."
+  exit 1
+fi
+echo "[ok] Built: $ZIP_PATH"
 
 echo ""
 echo "=== Publishing GitHub release $TAG ==="
@@ -34,6 +42,7 @@ fi
 gh release create "$TAG" \
   --title "$PRODUCT_NAME $TAG" \
   --notes "Release $TAG" \
-  "$DMG_PATH"
+  "$DMG_PATH" \
+  "$ZIP_PATH"
 
 echo "[ok] Release $TAG published"

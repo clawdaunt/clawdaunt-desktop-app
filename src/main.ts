@@ -13,8 +13,51 @@ import { getDeviceIdentity, signChallenge } from './device-identity';
 
 if (started) app.quit();
 
-import { updateElectronApp } from 'update-electron-app';
-updateElectronApp();
+// ── Update check ─────────────────────────────────────────────
+// Electron's native autoUpdater (Squirrel.Mac) requires code-signed builds.
+// For unsigned builds we check GitHub releases and open the browser to download.
+function checkForUpdates() {
+  if (!app.isPackaged) return;
+  const currentVersion = app.getVersion();
+  const repo = 'clawdaunt/clawdaunt-desktop-app';
+  const apiUrl = `https://api.github.com/repos/${repo}/releases/latest`;
+
+  https.get(apiUrl, { headers: { 'User-Agent': 'Clawdaunt' } }, (res) => {
+    let data = '';
+    res.on('data', (chunk: Buffer) => { data += chunk; });
+    res.on('end', () => {
+      try {
+        const release = JSON.parse(data);
+        const latestTag = (release.tag_name || '').replace(/^v/, '');
+        if (!latestTag || latestTag === currentVersion) return;
+        const cur = currentVersion.split('.').map(Number);
+        const lat = latestTag.split('.').map(Number);
+        const isNewer = lat[0] > cur[0] ||
+          (lat[0] === cur[0] && lat[1] > cur[1]) ||
+          (lat[0] === cur[0] && lat[1] === cur[1] && lat[2] > cur[2]);
+        if (!isNewer) return;
+
+        dialog.showMessageBox({
+          type: 'info',
+          buttons: ['Download', 'Later'],
+          title: 'Update Available',
+          message: `Clawdaunt v${latestTag}`,
+          detail: `A new version is available. You are running v${currentVersion}.\nDownload the latest version to update.`,
+        }).then(({ response }) => {
+          if (response === 0) {
+            const { shell } = require('electron');
+            shell.openExternal(release.html_url);
+          }
+        });
+      } catch { /* ignore parse errors */ }
+    });
+  }).on('error', () => { /* silently fail */ });
+}
+
+app.whenReady().then(() => {
+  checkForUpdates();
+  setInterval(checkForUpdates, 4 * 60 * 60 * 1000);
+});
 
 // Prevent EPIPE crashes when stdout/stderr pipe is closed (e.g. packaged app with no terminal)
 process.stdout?.on?.('error', (err: NodeJS.ErrnoException) => { if (err.code === 'EPIPE') return; throw err; });
@@ -263,6 +306,9 @@ function ensureDeviceWriteScope(): void {
 // Finder don't inherit it, so we resolve it from the login shell).
 const FALLBACK_PATHS = ['/opt/homebrew/bin', '/opt/homebrew/sbin', '/usr/local/bin', '/usr/local/sbin'];
 
+// Minimum openclaw version required for all Clawdaunt features (e.g. Gemini tool calling)
+const MIN_OPENCLAW_VERSION = '2026.3.2';
+
 function resolveShellPath(): string[] {
   try {
     const shell = process.env.SHELL || '/bin/zsh';
@@ -343,6 +389,88 @@ function enrichedEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     ...extra,
   };
 }
+
+// ── OpenClaw version helpers ────────────────────────────────
+
+/** Run `openclaw --version` and return the version string, or null on failure. */
+function getOpenclawVersion(binaryPath: string): string | null {
+  try {
+    const node = findNodeFor(binaryPath);
+    const out = execSync(`"${node}" "${binaryPath}" --version`, {
+      encoding: 'utf-8',
+      timeout: 10000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: enrichedEnv(),
+    });
+    // Output might be "openclaw 2026.3.8" or just "2026.3.8"
+    const match = out.trim().match(/(\d{4}\.\d+\.\d+)/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Compare two dot-separated version strings. Returns -1, 0, or 1. */
+function compareVersions(a: string, b: string): number {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const va = pa[i] || 0;
+    const vb = pb[i] || 0;
+    if (va < vb) return -1;
+    if (va > vb) return 1;
+  }
+  return 0;
+}
+
+/**
+ * Pick the best openclaw binary considering versions.
+ * Returns { path, version, source } for the chosen binary,
+ * plus an optional `updateInfo` if the system copy is outdated.
+ */
+function resolveOpenclaw(): {
+  path: string | null;
+  version: string | null;
+  source: 'system' | 'bundled';
+  updateInfo: { systemVersion: string; bundledVersion: string } | null;
+} {
+  // Find both candidates
+  let systemPath: string | null = null;
+  for (const dir of SEARCH_PATHS) {
+    const full = path.join(dir, 'openclaw');
+    if (fs.existsSync(full)) { systemPath = full; break; }
+  }
+  const bundledPath = path.join(bundledBinDir(), 'openclaw');
+  const hasBundled = fs.existsSync(bundledPath);
+
+  const systemVer = systemPath ? getOpenclawVersion(systemPath) : null;
+  const bundledVer = hasBundled ? getOpenclawVersion(bundledPath) : null;
+
+  let updateInfo: { systemVersion: string; bundledVersion: string } | null = null;
+
+  // If only one exists, use it
+  if (!systemPath && hasBundled) return { path: bundledPath, version: bundledVer, source: 'bundled', updateInfo: null };
+  if (systemPath && !hasBundled) return { path: systemPath, version: systemVer, source: 'system', updateInfo: null };
+  if (!systemPath && !hasBundled) return { path: null, version: null, source: 'system', updateInfo: null };
+
+  // Both exist — compare versions and pick the newer one
+  if (systemVer && bundledVer) {
+    if (compareVersions(systemVer, bundledVer) < 0) {
+      // System is older than bundled — use bundled, suggest update
+      updateInfo = { systemVersion: systemVer, bundledVersion: bundledVer };
+      return { path: bundledPath, version: bundledVer, source: 'bundled', updateInfo };
+    }
+    // System is same or newer — use system
+    return { path: systemPath, version: systemVer, source: 'system', updateInfo: null };
+  }
+
+  // Couldn't determine one or both versions — prefer system (original behavior)
+  return { path: systemPath, version: systemVer, source: 'system', updateInfo: null };
+}
+
+// Cached openclaw update info, sent to renderer after window loads
+let openclawUpdateInfo: { systemVersion: string; bundledVersion: string } | null = null;
+let openclawUpdateInProgress = false;
 
 // ── Process management ─────────────────────────────────────
 let gatewayProc: ChildProcess | null = null;
@@ -1426,8 +1554,9 @@ function connectGatewayWs(port: number, token: string): void {
           if (phase === 'start') {
             send('chat-event', { type: 'session.status', payload: { session_id: sid, status: 'busy' } });
           } else if (phase === 'end') {
-            send('chat-event', { type: 'session.idle', payload: { session_id: sid } });
-            if (sid === activeDesktopSessionKey) activeDesktopSessionKey = null;
+            // Don't send session.idle here — chat 'final' event handles it.
+            // Sending it here prematurely clears currentAssistantId before the
+            // chat final response text arrives, causing the chat to "reset".
           } else if (phase === 'error') {
             send('chat-event', { type: 'error', payload: { session_id: sid, error: data?.error || 'Unknown error' } });
           }
@@ -1489,10 +1618,17 @@ function startServer(): void {
   const config = loadConfig();
   intentionallyStopping = false;
 
-  const openclawBin = findBinary('openclaw');
+  const resolved = resolveOpenclaw();
+  const openclawBin = resolved.path;
   if (!openclawBin) {
     send('error', 'openclaw not found. Install with: brew install openclaw-cli');
     return;
+  }
+
+  // If system openclaw is outdated, notify the renderer
+  if (resolved.updateInfo) {
+    openclawUpdateInfo = resolved.updateInfo;
+    send('openclaw-update', openclawUpdateInfo);
   }
 
   const activeWs = config.workspaces.find((w) => w.id === config.activeWorkspaceId);
@@ -1749,9 +1885,19 @@ ipcMain.handle('sessions:list-persistent', () => {
             }
           }
           return { id: shortKey, gatewayKey: fullKey, title, updatedAt };
-        }).sort((a, b) => b.updatedAt - a.updatedAt);
-        console.log('[sessions:list-persistent] returning', result.length, 'sessions');
-        resolve(result);
+        });
+        // Deduplicate by shortKey — gateway may return same session under different key formats
+        // (e.g. "agent:main:desktop:abc" and "desktop:abc"). Keep the one with latest updatedAt.
+        const deduped = new Map<string, typeof result[0]>();
+        for (const s of result) {
+          const existing = deduped.get(s.id);
+          if (!existing || s.updatedAt > existing.updatedAt) {
+            deduped.set(s.id, s);
+          }
+        }
+        const finalResult = Array.from(deduped.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+        console.log('[sessions:list-persistent] returning', finalResult.length, 'sessions');
+        resolve(finalResult);
       } catch (e) { console.log('[sessions:list-persistent] parse error:', e); resolve([]); }
     });
   });
@@ -1834,6 +1980,7 @@ ipcMain.handle('sessions:load-history', (_, sessionKey: string) => {
             const parsed = JSON.parse(line);
             if (parsed.type !== 'user' && parsed.type !== 'assistant') continue;
             const text = extractMessageText(parsed.message?.content ?? '');
+            if (!text) continue;
             messages.push({
               id: `hist-${msgIndex++}`,
               role: parsed.type,
@@ -2038,6 +2185,71 @@ ipcMain.handle('cli:detect', () => ({
   claude: !!findBinary('claude'),
   codex: !!findBinary('codex'),
 }));
+
+ipcMain.handle('openclaw:update-info', () => openclawUpdateInfo);
+
+ipcMain.handle('openclaw:update', async () => {
+  if (openclawUpdateInProgress) return { success: false, error: 'Update already in progress' };
+  openclawUpdateInProgress = true;
+  send('openclaw-update-progress', { status: 'updating' });
+  try {
+    // Find brew
+    let brewPath = '';
+    for (const dir of ['/opt/homebrew/bin', '/usr/local/bin']) {
+      const full = path.join(dir, 'brew');
+      if (fs.existsSync(full)) { brewPath = full; break; }
+    }
+    if (!brewPath) {
+      send('openclaw-update-progress', { status: 'error', error: 'Homebrew not found' });
+      return { success: false, error: 'Homebrew not found. Install from https://brew.sh' };
+    }
+
+    // Run brew upgrade openclaw-cli
+    await new Promise<void>((resolve, reject) => {
+      const proc = spawn(brewPath, ['upgrade', 'openclaw-cli'], {
+        env: { ...process.env, PATH: SEARCH_PATHS.join(':') },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stderr = '';
+      proc.stdout?.on('data', (data: Buffer) => {
+        send('openclaw-update-progress', { status: 'updating', log: data.toString() });
+      });
+      proc.stderr?.on('data', (data: Buffer) => { stderr += data.toString(); });
+      proc.on('error', (err) => reject(err));
+      proc.on('exit', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(stderr || `brew upgrade exited with code ${code}`));
+      });
+    });
+
+    // Verify new version
+    const systemPath = (() => {
+      for (const dir of SEARCH_PATHS) {
+        const full = path.join(dir, 'openclaw');
+        if (fs.existsSync(full)) return full;
+      }
+      return null;
+    })();
+    const newVersion = systemPath ? getOpenclawVersion(systemPath) : null;
+
+    // Clear the update banner
+    openclawUpdateInfo = null;
+    send('openclaw-update-progress', { status: 'done', newVersion });
+    send('openclaw-update', null);
+
+    // Restart the server so it picks up the new binary
+    await stopServer(false);
+    startServer();
+
+    return { success: true, newVersion };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    send('openclaw-update-progress', { status: 'error', error: msg });
+    return { success: false, error: msg };
+  } finally {
+    openclawUpdateInProgress = false;
+  }
+});
 
 ipcMain.handle('config:set-ai-source', async (_, aiSource: AISource, apiKey?: string, apiProvider?: string) => {
   const config = loadConfig();

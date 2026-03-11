@@ -15,6 +15,9 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState('');
   const [qrModalOpen, setQrModalOpen] = useState(false);
   const [gatewayLog, setGatewayLog] = useState<string[]>([]);
+  const [openclawUpdate, setOpenclawUpdate] = useState<OpenclawUpdateInfo | null>(null);
+  const [openclawUpdateStatus, setOpenclawUpdateStatus] = useState<'idle' | 'updating' | 'done' | 'error'>('idle');
+  const [openclawUpdateError, setOpenclawUpdateError] = useState('');
   const prevClientConnected = useRef(false);
 
   useEffect(() => {
@@ -50,6 +53,20 @@ export default function App() {
 
     // Sync config when changed remotely (e.g. mobile switches workspace or AI source)
     window.api.onConfigChanged(setConfig);
+
+    // OpenClaw version update notifications
+    window.api.getOpenclawUpdateInfo().then(setOpenclawUpdate);
+    window.api.onOpenclawUpdate(setOpenclawUpdate);
+    window.api.onOpenclawUpdateProgress((progress) => {
+      if (progress.status === 'updating') setOpenclawUpdateStatus('updating');
+      else if (progress.status === 'done') {
+        setOpenclawUpdateStatus('done');
+        setTimeout(() => setOpenclawUpdate(null), 3000);
+      } else if (progress.status === 'error') {
+        setOpenclawUpdateStatus('error');
+        setOpenclawUpdateError(progress.error || 'Unknown error');
+      }
+    });
   }, []);
 
   // Auto-close QR modal when phone connects
@@ -85,6 +102,10 @@ export default function App() {
         gatewayLog={gatewayLog}
         onConfigUpdate={setConfig}
         onShowQR={() => setQrModalOpen(true)}
+        openclawUpdate={openclawUpdate}
+        openclawUpdateStatus={openclawUpdateStatus}
+        openclawUpdateError={openclawUpdateError}
+        onDismissUpdate={() => setOpenclawUpdate(null)}
       />
       <QRModal
         open={qrModalOpen}

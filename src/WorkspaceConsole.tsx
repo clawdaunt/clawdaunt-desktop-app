@@ -19,6 +19,10 @@ interface WorkspaceConsoleProps {
   gatewayLog: string[];
   onConfigUpdate: (config: Config) => void;
   onShowQR: () => void;
+  openclawUpdate: OpenclawUpdateInfo | null;
+  openclawUpdateStatus: 'idle' | 'updating' | 'done' | 'error';
+  openclawUpdateError: string;
+  onDismissUpdate: () => void;
 }
 
 export default function WorkspaceConsole({
@@ -31,6 +35,10 @@ export default function WorkspaceConsole({
   gatewayLog,
   onConfigUpdate,
   onShowQR,
+  openclawUpdate,
+  openclawUpdateStatus,
+  openclawUpdateError,
+  onDismissUpdate,
 }: WorkspaceConsoleProps) {
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
@@ -81,7 +89,14 @@ export default function WorkspaceConsole({
 
   // Poll persistent past sessions from gateway
   const refreshPastSessions = useCallback(() => {
-    window.api.listPersistentSessions().then(setPastSessions).catch(() => {});
+    window.api.listPersistentSessions().then(sessions => {
+      const seen = new Set<string>();
+      setPastSessions(sessions.filter(s => {
+        if (seen.has(s.id)) return false;
+        seen.add(s.id);
+        return true;
+      }));
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -127,16 +142,9 @@ export default function WorkspaceConsole({
       return;
     }
 
-    if (type === 'session.status') {
-      const status = payload.status as string;
-      if (status === 'busy') {
-        setIsStreaming(true);
-      } else if (status === 'idle') {
-        setIsStreaming(false);
-        streamAccum.current.clear();
-        currentAssistantId.current = null;
-      }
-    } else if (type === 'session.idle' || type === 'session.ended') {
+    if (type === 'session.status' && (payload.status as string) === 'busy') {
+      setIsStreaming(true);
+    } else if (type === 'session.idle' || type === 'session.ended' || (type === 'session.status' && (payload.status as string) === 'idle')) {
       const wasStreaming = currentAssistantId.current !== null;
       const hadStreamedContent = streamAccum.current.size > 0;
       setIsStreaming(false);
@@ -145,9 +153,21 @@ export default function WorkspaceConsole({
       // Only reload history if we didn't get content via SSE streaming
       // (CLI-backed agents don't stream via SSE, so we need to reload for those)
       if (wasStreaming && chatSessionKey && !hadStreamedContent) {
-        window.api.loadSessionHistory(chatSessionKey)
-          .then(history => setChatMessages(history))
-          .catch(() => {});
+        const key = chatSessionKey;
+        // Delay + retry: gateway may not have flushed session to disk yet
+        const loadWithRetry = (attempt: number) => {
+          window.api.loadSessionHistory(key)
+            .then(history => {
+              if (history.length > 0) {
+                setChatMessages(history);
+              } else if (attempt < 3) {
+                setTimeout(() => loadWithRetry(attempt + 1), 1500);
+              }
+              // If all retries return empty, keep existing messages (don't wipe)
+            })
+            .catch(() => {});
+        };
+        setTimeout(() => loadWithRetry(0), 800);
       }
     } else if (type === 'session.error' || type === 'error') {
       const errorText = (payload.error as string) || 'An error occurred';
@@ -967,6 +987,46 @@ export default function WorkspaceConsole({
 
       {/* Main content */}
       <div className="main-content">
+        {openclawUpdate && (
+          <div className={`update-banner${openclawUpdateStatus === 'error' ? ' update-banner-error' : openclawUpdateStatus === 'done' ? ' update-banner-done' : ''}`}>
+            <div className="update-banner-text">
+              {openclawUpdateStatus === 'updating' ? (
+                <>
+                  <span className="update-spinner" />
+                  Updating openclaw...
+                </>
+              ) : openclawUpdateStatus === 'done' ? (
+                'openclaw updated successfully!'
+              ) : openclawUpdateStatus === 'error' ? (
+                <>Update failed: {openclawUpdateError}</>
+              ) : (
+                <>
+                  System openclaw <strong>v{openclawUpdate.systemVersion}</strong> is outdated.
+                  Using bundled <strong>v{openclawUpdate.bundledVersion}</strong>.
+                </>
+              )}
+            </div>
+            <div className="update-banner-actions">
+              {openclawUpdateStatus === 'idle' && (
+                <button className="update-btn" onClick={() => window.api.updateOpenclaw()}>
+                  Update Now
+                </button>
+              )}
+              {openclawUpdateStatus === 'error' && (
+                <button className="update-btn" onClick={() => window.api.updateOpenclaw()}>
+                  Retry
+                </button>
+              )}
+              {openclawUpdateStatus !== 'updating' && (
+                <button className="update-dismiss" onClick={onDismissUpdate}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                  </svg>
+                </button>
+              )}
+            </div>
+          </div>
+        )}
         <div className="main-header" style={!sidebarOpen ? { paddingLeft: 68 } : undefined}>
           <div className="main-header-left">
             {/* Provider picker */}
