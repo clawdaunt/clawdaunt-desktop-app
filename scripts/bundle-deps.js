@@ -37,7 +37,8 @@ function download(url, destPath) {
     proto.get(url, { headers: { 'User-Agent': 'clawdaunt-bundler' } }, (res) => {
       // Follow redirects
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return download(res.headers.location, destPath).then(resolve, reject);
+        const redirectUrl = new URL(res.headers.location, url).toString();
+        return download(redirectUrl, destPath).then(resolve, reject);
       }
       if (res.statusCode !== 200) {
         return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
@@ -242,9 +243,29 @@ async function bundleOpenclaw() {
   }
 
   console.log(`[cp] Copying openclaw from ${pkgDir}`);
-  fs.copyFileSync(realPath, path.join(BIN_DIR, binName));
+
+  // On Windows, `where openclaw` resolves to an `openclaw.cmd` shim, not the
+  // actual JS entry script. Prefer the entry script from package.json's "bin"
+  // field so the runtime can invoke it via node directly.
+  let srcBinPath = realPath;
+  try {
+    const pkgJson = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'));
+    if (pkgJson && pkgJson.bin) {
+      const binRel = typeof pkgJson.bin === 'string' ? pkgJson.bin : pkgJson.bin.openclaw;
+      if (binRel) {
+        const candidate = path.resolve(pkgDir, binRel);
+        if (fileExists(candidate)) {
+          srcBinPath = candidate;
+        }
+      }
+    }
+  } catch { /* fall back to realPath */ }
+
+  // Bundle the entry script without .exe extension (it's a JS file run via node)
+  const bundledName = IS_WINDOWS ? 'openclaw' : binName;
+  fs.copyFileSync(srcBinPath, path.join(BIN_DIR, bundledName));
   if (!IS_WINDOWS) {
-    fs.chmodSync(path.join(BIN_DIR, binName), 0o755);
+    fs.chmodSync(path.join(BIN_DIR, bundledName), 0o755);
   }
 
   // Copy dist/ (built output)

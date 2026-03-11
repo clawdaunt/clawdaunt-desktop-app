@@ -55,4 +55,5 @@ jobs:
           path: |
             out/make/squirrel.windows/**/*.exe
             out/make/squirrel.windows/**/*.nupkg
+            out/make/squirrel.windows/**/RELEASES
             out/make/zip/**/*.zip

@@ -88,6 +88,9 @@ jobs:
           find artifacts/macos -name '*.dmg' -exec cp {} release-files/ \;
           # Windows installer (Squirrel .exe setup)
           find artifacts/windows -path '*/squirrel.windows/*' -name '*.exe' -exec cp {} release-files/ \;
+          # Squirrel.Windows update assets (RELEASES manifest and .nupkg packages)
+          find artifacts/windows -path '*/squirrel.windows/*' -name 'RELEASES' -exec cp {} release-files/ \;
+          find artifacts/windows -path '*/squirrel.windows/*' -name '*.nupkg' -exec cp {} release-files/ \;
           # Windows ZIP
           find artifacts/windows -path '*/zip/*' -name '*.zip' -exec cp {} release-files/ \;
           echo "=== Release files ==="

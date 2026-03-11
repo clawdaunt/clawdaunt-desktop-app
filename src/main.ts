@@ -268,10 +268,10 @@ function ensureDeviceWriteScope(): void {
 const FALLBACK_PATHS = IS_WINDOWS
   ? [
       path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'nodejs'),
-      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'nodejs'),
-      path.join(process.env.APPDATA || '', 'npm'),
-      path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'WinGet', 'Links'),
-    ].filter(Boolean)
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'nodejs'),
+      process.env.APPDATA && path.join(process.env.APPDATA, 'npm'),
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Links'),
+    ].filter((p): p is string => typeof p === 'string' && path.isAbsolute(p))
   : ['/opt/homebrew/bin', '/opt/homebrew/sbin', '/usr/local/bin', '/usr/local/sbin'];
 
 function resolveShellPath(): string[] {
@@ -303,24 +303,40 @@ function bundledBinDir(): string {
 // to avoid version/config conflicts.
 const PREFER_SYSTEM = new Set(['openclaw', 'claude', 'codex']);
 
+// On Windows, npm-installed CLIs (openclaw, claude, codex) are exposed as .cmd
+// shims rather than .exe binaries. We search for multiple extensions in order.
+const WIN_EXTENSIONS = IS_WINDOWS ? ['.cmd', '.exe', ''] : [''];
+
+function findBinaryInDir(name: string, dir: string): string | null {
+  for (const ext of WIN_EXTENSIONS) {
+    const full = path.join(dir, name + ext);
+    if (fs.existsSync(full)) return full;
+  }
+  return null;
+}
+
 function findBinary(name: string): string | null {
-  const exeName = name + EXE_EXT;
   if (PREFER_SYSTEM.has(name)) {
     // 1. User's shell PATH + fallback paths first
     for (const dir of SEARCH_PATHS) {
-      const full = path.join(dir, exeName);
-      if (fs.existsSync(full)) return full;
+      const found = findBinaryInDir(name, dir);
+      if (found) return found;
     }
-    // 2. Fall back to bundled
-    const bundled = path.join(bundledBinDir(), exeName);
+    // 2. Fall back to bundled (bundled copies are always the raw script, not .cmd)
+    const bundled = path.join(bundledBinDir(), name + EXE_EXT);
     if (fs.existsSync(bundled)) return bundled;
+    // Also check without extension (JS entry script)
+    if (IS_WINDOWS) {
+      const bundledNoExt = path.join(bundledBinDir(), name);
+      if (fs.existsSync(bundledNoExt)) return bundledNoExt;
+    }
   } else {
     // Infrastructure binaries (node, cloudflared): prefer bundled for stability
-    const bundled = path.join(bundledBinDir(), exeName);
+    const bundled = path.join(bundledBinDir(), name + EXE_EXT);
     if (fs.existsSync(bundled)) return bundled;
     for (const dir of SEARCH_PATHS) {
-      const full = path.join(dir, exeName);
-      if (fs.existsSync(full)) return full;
+      const found = findBinaryInDir(name, dir);
+      if (found) return found;
     }
   }
   return null;
