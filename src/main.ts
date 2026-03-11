@@ -303,12 +303,16 @@ function bundledBinDir(): string {
 // to avoid version/config conflicts.
 const PREFER_SYSTEM = new Set(['openclaw', 'claude', 'codex']);
 
-// On Windows, npm-installed CLIs (openclaw, claude, codex) are exposed as .cmd
-// shims rather than .exe binaries. We search for multiple extensions in order.
-const WIN_EXTENSIONS = IS_WINDOWS ? ['.cmd', '.exe', ''] : [''];
+// On Windows, npm-installed CLIs (openclaw, claude, codex) are JS entry scripts
+// run via node, NOT native .exe binaries. The system exposes them as .cmd shims,
+// but we must NOT return .cmd paths since the runtime invokes them via
+// spawn(node, [binaryPath, ...]). Prefer: extensionless > .exe > .cmd (last resort).
+// Infrastructure binaries (cloudflared, node) are real .exe files.
+const WIN_CLI_EXTENSIONS = IS_WINDOWS ? ['', '.exe', '.cmd'] : [''];
+const WIN_INFRA_EXTENSIONS = IS_WINDOWS ? ['.exe', ''] : [''];
 
-function findBinaryInDir(name: string, dir: string): string | null {
-  for (const ext of WIN_EXTENSIONS) {
+function findBinaryInDir(name: string, dir: string, extensions: string[]): string | null {
+  for (const ext of extensions) {
     const full = path.join(dir, name + ext);
     if (fs.existsSync(full)) return full;
   }
@@ -317,25 +321,24 @@ function findBinaryInDir(name: string, dir: string): string | null {
 
 function findBinary(name: string): string | null {
   if (PREFER_SYSTEM.has(name)) {
-    // 1. User's shell PATH + fallback paths first
+    // Node-run CLIs: prefer extensionless JS entry script over .cmd shim
     for (const dir of SEARCH_PATHS) {
-      const found = findBinaryInDir(name, dir);
+      const found = findBinaryInDir(name, dir, WIN_CLI_EXTENSIONS);
       if (found) return found;
     }
-    // 2. Fall back to bundled (bundled copies are always the raw script, not .cmd)
-    const bundled = path.join(bundledBinDir(), name + EXE_EXT);
+    // Fall back to bundled (bundled copies are the raw JS script without .cmd)
+    const bundled = path.join(bundledBinDir(), name);
     if (fs.existsSync(bundled)) return bundled;
-    // Also check without extension (JS entry script)
     if (IS_WINDOWS) {
-      const bundledNoExt = path.join(bundledBinDir(), name);
-      if (fs.existsSync(bundledNoExt)) return bundledNoExt;
+      const bundledExe = path.join(bundledBinDir(), name + '.exe');
+      if (fs.existsSync(bundledExe)) return bundledExe;
     }
   } else {
-    // Infrastructure binaries (node, cloudflared): prefer bundled for stability
+    // Infrastructure binaries (node, cloudflared): real executables
     const bundled = path.join(bundledBinDir(), name + EXE_EXT);
     if (fs.existsSync(bundled)) return bundled;
     for (const dir of SEARCH_PATHS) {
-      const found = findBinaryInDir(name, dir);
+      const found = findBinaryInDir(name, dir, WIN_INFRA_EXTENSIONS);
       if (found) return found;
     }
   }

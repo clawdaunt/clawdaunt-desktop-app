@@ -176,8 +176,10 @@ async function bundleNode() {
 // ── openclaw ────────────────────────────────────────────────
 
 async function bundleOpenclaw() {
-  const binName = 'openclaw' + EXE_EXT;
-  if (fileExists(path.join(BIN_DIR, binName)) && fileExists(path.join(BIN_DIR, 'node_modules'))) {
+  // On Windows we bundle the JS entry script as 'openclaw' (no .exe), so check
+  // the actual bundled filename for idempotency, not the platform-suffixed name.
+  const bundledName = IS_WINDOWS ? 'openclaw' : 'openclaw' + EXE_EXT;
+  if (fileExists(path.join(BIN_DIR, bundledName)) && fileExists(path.join(BIN_DIR, 'node_modules'))) {
     console.log('[ok] openclaw already bundled');
     return;
   }
@@ -261,8 +263,8 @@ async function bundleOpenclaw() {
     }
   } catch { /* fall back to realPath */ }
 
-  // Bundle the entry script without .exe extension (it's a JS file run via node)
-  const bundledName = IS_WINDOWS ? 'openclaw' : binName;
+  // Bundle the entry script — always as 'openclaw' (no .exe) since it's a JS
+  // file invoked via node. On macOS/Linux the original script is already extensionless.
   fs.copyFileSync(srcBinPath, path.join(BIN_DIR, bundledName));
   if (!IS_WINDOWS) {
     fs.chmodSync(path.join(BIN_DIR, bundledName), 0o755);
