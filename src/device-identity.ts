@@ -51,7 +51,8 @@ export function getDeviceIdentity(): DeviceIdentity {
   if (!fs.existsSync(CONFIG_DIR)) {
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
   }
-  fs.writeFileSync(DEVICE_PATH, JSON.stringify(identity, null, 2) + '\n', { mode: 0o600 });
+  const writeOpts: fs.WriteFileOptions = process.platform !== 'win32' ? { mode: 0o600 } : {};
+  fs.writeFileSync(DEVICE_PATH, JSON.stringify(identity, null, 2) + '\n', writeOpts);
 
   cached = identity;
   return identity;

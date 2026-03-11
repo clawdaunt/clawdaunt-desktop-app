@@ -10,6 +10,35 @@ import { FusesPlugin } from '@electron-forge/plugin-fuses';
 import { PublisherGithub } from '@electron-forge/publisher-github';
 import { FuseV1Options, FuseVersion } from '@electron/fuses';
 
+// Build platform-appropriate makers list
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const makers: any[] = [];
+
+if (process.platform === 'darwin') {
+  makers.push(
+    new MakerDMG({ format: 'ULFO', name: 'Clawdaunt' }),
+    new MakerZIP({}, ['darwin']),
+  );
+}
+
+if (process.platform === 'win32') {
+  makers.push(
+    new MakerSquirrel({
+      name: 'Clawdaunt',
+      setupIcon: 'resources/icon.ico',
+    }),
+    new MakerZIP({}, ['win32']),
+  );
+}
+
+if (process.platform === 'linux') {
+  makers.push(
+    new MakerDeb({}),
+    new MakerRpm({}),
+    new MakerZIP({}, ['linux']),
+  );
+}
+
 const config: ForgeConfig = {
   packagerConfig: {
     asar: true,
@@ -17,6 +46,7 @@ const config: ForgeConfig = {
     executableName: 'Clawdaunt',
     icon: 'resources/icon',
     extraResource: ['resources/bin'],
+    // macOS code signing
     ...(process.env.APPLE_SIGNING_IDENTITY ? {
       osxSign: {
         identity: process.env.APPLE_SIGNING_IDENTITY,
@@ -34,16 +64,7 @@ const config: ForgeConfig = {
     } : {}),
   },
   rebuildConfig: {},
-  makers: [
-    new MakerDMG({
-      format: 'ULFO',
-      name: 'Clawdaunt',
-    }),
-    new MakerZIP({}, ['darwin']),
-    new MakerSquirrel({}),
-    new MakerDeb({}),
-    new MakerRpm({}),
-  ],
+  makers,
   publishers: [
     new PublisherGithub({
       repository: {

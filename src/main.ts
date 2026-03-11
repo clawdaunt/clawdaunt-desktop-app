@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, powerMonitor } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, powerMonitor, powerSaveBlocker } from 'electron';
 import { ChildProcess, spawn, execSync, execFile } from 'node:child_process';
 import http, { createServer, Server as HttpServer } from 'node:http';
 import net from 'node:net';
@@ -10,6 +10,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import started from 'electron-squirrel-startup';
 import { getDeviceIdentity, signChallenge } from './device-identity';
+
+const IS_WINDOWS = process.platform === 'win32';
+const IS_MAC = process.platform === 'darwin';
+const EXE_EXT = IS_WINDOWS ? '.exe' : '';
 
 if (started) app.quit();
 
@@ -258,12 +262,23 @@ function ensureDeviceWriteScope(): void {
 }
 
 // ── Binary discovery ───────────────────────────────────────
-// Bundled binaries live in Clawdaunt.app/Contents/Resources/bin/
+// Bundled binaries live next to the app resources (macOS: Clawdaunt.app/Contents/Resources/bin/).
 // Falls back to user's shell PATH (Electron apps launched from
-// Finder don't inherit it, so we resolve it from the login shell).
-const FALLBACK_PATHS = ['/opt/homebrew/bin', '/opt/homebrew/sbin', '/usr/local/bin', '/usr/local/sbin'];
+// Finder/Explorer don't inherit it, so we resolve it from the login shell).
+const FALLBACK_PATHS = IS_WINDOWS
+  ? [
+      path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'nodejs'),
+      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'nodejs'),
+      path.join(process.env.APPDATA || '', 'npm'),
+      path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'WinGet', 'Links'),
+    ].filter(Boolean)
+  : ['/opt/homebrew/bin', '/opt/homebrew/sbin', '/usr/local/bin', '/usr/local/sbin'];
 
 function resolveShellPath(): string[] {
+  if (IS_WINDOWS) {
+    // Windows: process.env.PATH is already available to Electron
+    return (process.env.PATH || '').split(';').filter(Boolean);
+  }
   try {
     const shell = process.env.SHELL || '/bin/zsh';
     const out = execSync(`${shell} -l -i -c 'echo $PATH'`, {
@@ -289,21 +304,22 @@ function bundledBinDir(): string {
 const PREFER_SYSTEM = new Set(['openclaw', 'claude', 'codex']);
 
 function findBinary(name: string): string | null {
+  const exeName = name + EXE_EXT;
   if (PREFER_SYSTEM.has(name)) {
     // 1. User's shell PATH + fallback paths first
     for (const dir of SEARCH_PATHS) {
-      const full = path.join(dir, name);
+      const full = path.join(dir, exeName);
       if (fs.existsSync(full)) return full;
     }
     // 2. Fall back to bundled
-    const bundled = path.join(bundledBinDir(), name);
+    const bundled = path.join(bundledBinDir(), exeName);
     if (fs.existsSync(bundled)) return bundled;
   } else {
     // Infrastructure binaries (node, cloudflared): prefer bundled for stability
-    const bundled = path.join(bundledBinDir(), name);
+    const bundled = path.join(bundledBinDir(), exeName);
     if (fs.existsSync(bundled)) return bundled;
     for (const dir of SEARCH_PATHS) {
-      const full = path.join(dir, name);
+      const full = path.join(dir, exeName);
       if (fs.existsSync(full)) return full;
     }
   }
@@ -312,9 +328,10 @@ function findBinary(name: string): string | null {
 
 /** Returns the bundled node binary, or falls back to system node. */
 function findNode(): string {
-  const bundled = path.join(bundledBinDir(), 'node');
+  const exeName = 'node' + EXE_EXT;
+  const bundled = path.join(bundledBinDir(), exeName);
   if (fs.existsSync(bundled)) return bundled;
-  return 'node';
+  return IS_WINDOWS ? 'node.exe' : 'node';
 }
 
 /**
@@ -328,8 +345,9 @@ function findNodeFor(binaryPath: string): string {
   if (binaryPath.startsWith(bundled)) return findNode();
   // Binary is system-installed — prefer system node so native addons match,
   // but fall back to bundled node if no system node is available.
+  const nodeExe = 'node' + EXE_EXT;
   for (const dir of SEARCH_PATHS) {
-    const full = path.join(dir, 'node');
+    const full = path.join(dir, nodeExe);
     if (fs.existsSync(full)) return full;
   }
   return findNode();
@@ -338,7 +356,7 @@ function findNodeFor(binaryPath: string): string {
 function enrichedEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
     ...process.env,
-    PATH: SEARCH_PATHS.join(':'),
+    PATH: SEARCH_PATHS.join(path.delimiter),
     NODE_PATH: path.join(bundledBinDir(), 'node_modules'),
     ...extra,
   };
@@ -360,6 +378,7 @@ let clientPresenceInterval: ReturnType<typeof setInterval> | null = null;
 let clientConnectedState = false;
 let clientAwayState = false;
 let caffeinateProc: ChildProcess | null = null;
+let powerSaveBlockerId: number | null = null;
 let gatewayWs: WebSocket | null = null;
 let gatewayWsRetryTimer: ReturnType<typeof setTimeout> | null = null;
 const sessions = new Map<string, { id: string; status: 'busy' | 'idle'; title: string; skill?: string; startedAt: number; workspaceId?: string }>();
@@ -1178,7 +1197,9 @@ function startTunnel(): void {
   const config = loadConfig();
   const cloudflaredBin = findBinary('cloudflared');
   if (!cloudflaredBin) {
-    send('error', 'cloudflared not found. Install with: brew install cloudflare/cloudflare/cloudflared');
+    send('error', IS_WINDOWS
+      ? 'cloudflared not found. Install from: https://github.com/cloudflare/cloudflared/releases'
+      : 'cloudflared not found. Install with: brew install cloudflare/cloudflare/cloudflared');
     return;
   }
 
@@ -1307,7 +1328,7 @@ function connectGatewayWs(port: number, token: string): void {
           type: 'req', id: 'connect-1', method: 'connect',
           params: {
             minProtocol: 3, maxProtocol: 3,
-            client: { id: 'openclaw-macos', version: '1.0.0', platform: 'darwin', mode: 'ui' },
+            client: { id: `openclaw-${IS_WINDOWS ? 'windows' : IS_MAC ? 'macos' : 'linux'}`, version: '1.0.0', platform: process.platform, mode: 'ui' },
             role: 'operator',
             scopes: ['operator.read', 'operator.write', 'operator.approvals'],
             caps: ['tool-events'],
@@ -1644,6 +1665,10 @@ function stopAll(): void {
   stopSetupServer();
   caffeinateProc?.kill();
   caffeinateProc = null;
+  if (powerSaveBlockerId !== null) {
+    powerSaveBlocker.stop(powerSaveBlockerId);
+    powerSaveBlockerId = null;
+  }
   cloudflaredProc?.kill();
   cloudflaredProc = null;
   gatewayProc?.kill();
@@ -2189,8 +2214,10 @@ const createWindow = () => {
     minHeight: 500,
     resizable: true,
     maximizable: true,
-    titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 16, y: 16 },
+    ...(IS_MAC ? {
+      titleBarStyle: 'hiddenInset' as const,
+      trafficLightPosition: { x: 16, y: 16 },
+    } : {}),
     backgroundColor: '#ffffff',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -2211,11 +2238,16 @@ const createWindow = () => {
 app.on('ready', () => {
   createWindow();
 
-  // Prevent macOS from sleeping while the app is running so the
+  // Prevent the system from sleeping while the app is running so the
   // Cloudflare tunnel (and gateway) stay alive for phone connections.
-  // -d: prevent display sleep, -i: prevent idle sleep, -s: prevent system sleep
-  caffeinateProc = spawn('caffeinate', ['-dis']);
-  caffeinateProc.on('error', () => { caffeinateProc = null; });
+  if (IS_MAC) {
+    // macOS: caffeinate -d (display) -i (idle) -s (system)
+    caffeinateProc = spawn('caffeinate', ['-dis']);
+    caffeinateProc.on('error', () => { caffeinateProc = null; });
+  } else {
+    // Windows/Linux: use Electron's built-in powerSaveBlocker
+    powerSaveBlockerId = powerSaveBlocker.start('prevent-app-suspension');
+  }
 
   const config = loadConfig();
   // Start proxy before tunnel — cloudflared points to the proxy port

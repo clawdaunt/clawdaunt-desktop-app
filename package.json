@@ -9,7 +9,7 @@
   "scripts": {
     "start": "electron-forge start",
     "package": "electron-forge package",
-    "bundle-deps": "bash scripts/bundle-deps.sh",
+    "bundle-deps": "node scripts/bundle-deps.js",
     "make": "npm run bundle-deps && electron-forge make",
     "publish": "npm run bundle-deps && electron-forge publish",
     "lint": "eslint --ext .ts,.tsx ."
