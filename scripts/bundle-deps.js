@@ -59,11 +59,12 @@ function extractTgz(archivePath, destDir) {
 /** Extract a .zip archive to a directory. */
 function extractZip(archivePath, destDir) {
   if (IS_WINDOWS) {
-    // Use PowerShell's Expand-Archive
-    execSync(
-      `powershell -NoProfile -Command "Expand-Archive -Force -Path '${archivePath}' -DestinationPath '${destDir}'"`,
-      { stdio: 'inherit' }
-    );
+    // Use PowerShell's Expand-Archive with args array to avoid path injection
+    execFileSync('powershell', [
+      '-NoProfile', '-Command',
+      'Expand-Archive -Force -Path $args[0] -DestinationPath $args[1]',
+      archivePath, destDir,
+    ], { stdio: 'inherit' });
   } else {
     execSync(`unzip -o "${archivePath}" -d "${destDir}"`, { stdio: 'inherit' });
   }

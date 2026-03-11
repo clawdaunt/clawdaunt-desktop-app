@@ -306,9 +306,9 @@ const PREFER_SYSTEM = new Set(['openclaw', 'claude', 'codex']);
 // On Windows, npm-installed CLIs (openclaw, claude, codex) are JS entry scripts
 // run via node, NOT native .exe binaries. The system exposes them as .cmd shims,
 // but we must NOT return .cmd paths since the runtime invokes them via
-// spawn(node, [binaryPath, ...]). Prefer: extensionless > .exe > .cmd (last resort).
+// spawn(node, [binaryPath, ...]). Prefer: extensionless > .exe only.
 // Infrastructure binaries (cloudflared, node) are real .exe files.
-const WIN_CLI_EXTENSIONS = IS_WINDOWS ? ['', '.exe', '.cmd'] : [''];
+const WIN_CLI_EXTENSIONS = IS_WINDOWS ? ['', '.exe'] : [''];
 const WIN_INFRA_EXTENSIONS = IS_WINDOWS ? ['.exe', ''] : [''];
 
 function findBinaryInDir(name: string, dir: string, extensions: string[]): string | null {
@@ -1216,9 +1216,12 @@ function startTunnel(): void {
   const config = loadConfig();
   const cloudflaredBin = findBinary('cloudflared');
   if (!cloudflaredBin) {
-    send('error', IS_WINDOWS
+    const installMessage = IS_WINDOWS
       ? 'cloudflared not found. Install from: https://github.com/cloudflare/cloudflared/releases'
-      : 'cloudflared not found. Install with: brew install cloudflare/cloudflare/cloudflared');
+      : IS_MAC
+        ? 'cloudflared not found. Install with: brew install cloudflare/cloudflare/cloudflared'
+        : 'cloudflared not found. See: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/';
+    send('error', installMessage);
     return;
   }
 
