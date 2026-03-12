@@ -76,6 +76,7 @@ interface ElectronAPI {
   listSessions: () => Promise<GatewaySession[]>;
   listPersistentSessions: () => Promise<PersistentSession[]>;
   deleteSession: (gatewayKey: string) => Promise<boolean>;
+  clearSessionHistory: (sessionKey: string) => Promise<boolean>;
   loadSessionHistory: (sessionKey: string) => Promise<ChatMessage[]>;
   onSessionsUpdated: (cb: (sessions: GatewaySession[]) => void) => void;
   onConfigChanged: (cb: (config: Config) => void) => void;
@@ -84,6 +85,7 @@ interface ElectronAPI {
   abortChat: (sessionKey: string) => Promise<void>;
   pickImage: () => Promise<ChatAttachment | null>;
   pickFile: () => Promise<FileReference[] | null>;
+  captureScreenshot: () => Promise<ChatAttachment | null>;
   onChatEvent: (cb: (event: ChatEvent) => void) => void;
   offChatEvent: () => void;
 

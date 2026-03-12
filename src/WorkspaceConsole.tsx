@@ -133,6 +133,18 @@ export default function WorkspaceConsole({
     });
   };
 
+  const handleDeletePastSession = async (session: PersistentSession) => {
+    const wasViewing = chatSend.chatSessionKey === session.id;
+    await sessionsHook.handleDeletePastSession(session);
+    if (wasViewing) chatSend.handleNewChat();
+  };
+
+  const handleBatchDeleteSessions = async () => {
+    const wasViewing = chatSend.chatSessionKey && sessionsHook.selectedSessions.has(chatSend.chatSessionKey);
+    await sessionsHook.handleBatchDeleteSessions();
+    if (wasViewing) chatSend.handleNewChat();
+  };
+
   const handleCreateWorkspace = async () => {
     onConfigUpdate(await window.api.createWorkspace());
   };
@@ -163,8 +175,8 @@ export default function WorkspaceConsole({
         onOpenSettings={() => setSettingsOpen(true)}
         onNewChat={chatSend.handleNewChat}
         onLoadPastSession={handleLoadPastSession}
-        onDeletePastSession={sessionsHook.handleDeletePastSession}
-        onBatchDeleteSessions={sessionsHook.handleBatchDeleteSessions}
+        onDeletePastSession={handleDeletePastSession}
+        onBatchDeleteSessions={handleBatchDeleteSessions}
         toggleSessionSelection={sessionsHook.toggleSessionSelection}
         toggleSelectAllSessions={sessionsHook.toggleSelectAllSessions}
         isMainSession={sessionsHook.isMainSession}
@@ -261,7 +273,7 @@ export default function WorkspaceConsole({
                   <div className="provider-menu-group">
                     <span className="provider-menu-group-label">API Providers</span>
                     {PROVIDERS.filter(p => p.aiSource === 'api-key').map((p) => {
-                      const hasKey = !!(config.apiKey && config.apiProvider === p.apiProvider);
+                      const hasKey = !!(config.apiKeys?.[p.apiProvider!] || (config.apiKey && config.apiProvider === p.apiProvider));
                       return (
                         <button
                           key={p.id}
@@ -408,6 +420,23 @@ export default function WorkspaceConsole({
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                       <line x1="12" y1="5" x2="12" y2="19" />
                       <line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                  </button>
+                  <button
+                    className="chat-attach-btn"
+                    onClick={async () => {
+                      const attachment = await window.api.captureScreenshot();
+                      if (attachment) {
+                        chatSend.setPendingImages(prev => [...prev, attachment]);
+                      }
+                    }}
+                    title="Take screenshot"
+                    disabled={chatEvents.isStreaming}
+                  >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+                      <line x1="8" y1="21" x2="16" y2="21" />
+                      <line x1="12" y1="17" x2="12" y2="21" />
                     </svg>
                   </button>
                   <div className="chat-input-toolbar-right">

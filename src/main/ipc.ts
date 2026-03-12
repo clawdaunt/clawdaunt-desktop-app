@@ -1,4 +1,4 @@
-import { ipcMain, dialog } from 'electron';
+import { ipcMain, dialog, desktopCapturer } from 'electron';
 import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -118,6 +118,50 @@ export function registerIpcHandlers(): void {
           resolve(finalResult);
         } catch (e) { console.log('[sessions:list-persistent] parse error:', e); resolve([]); }
       });
+    });
+  });
+
+  ipcMain.handle('sessions:clear-history', (_, sessionKey: string) => {
+    return new Promise((resolve) => {
+      const sessionsDir = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'sessions');
+      const sessionsPath = path.join(sessionsDir, 'sessions.json');
+      let sessionsData: Record<string, { sessionId?: string; claudeCliSessionId?: string }> = {};
+      try { sessionsData = JSON.parse(fs.readFileSync(sessionsPath, 'utf-8')); } catch { /* ok */ }
+
+      const strippedKey = sessionKey.replace(/^agent:main:/, '');
+      const entry = sessionsData[strippedKey] || sessionsData[sessionKey];
+
+      // Delete JSONL files
+      if (entry?.sessionId) {
+        const gwFile = path.join(sessionsDir, `${entry.sessionId}.jsonl`);
+        try { fs.unlinkSync(gwFile); } catch { /* ok */ }
+      }
+      if (entry?.claudeCliSessionId) {
+        const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+        const projectDirs = fs.existsSync(claudeProjectsDir) ? fs.readdirSync(claudeProjectsDir) : [];
+        for (const dir of projectDirs) {
+          const candidate = path.join(claudeProjectsDir, dir, `${entry.claudeCliSessionId}.jsonl`);
+          try { fs.unlinkSync(candidate); break; } catch { /* ok */ }
+        }
+      }
+
+      // Remove entry from sessions.json so gateway gets a fresh session ID
+      const matchKey = sessionsData[strippedKey] ? strippedKey : sessionsData[sessionKey] ? sessionKey : null;
+      if (matchKey) {
+        delete sessionsData[matchKey];
+        try { fs.writeFileSync(sessionsPath, JSON.stringify(sessionsData, null, 2)); } catch { /* ok */ }
+      }
+
+      // Tell gateway to drop its in-memory state — it'll recreate on next message
+      const openclawBin = findBinary('openclaw');
+      if (openclawBin) {
+        execFile(findNodeFor(openclawBin), [openclawBin, 'gateway', 'call', 'sessions.delete', '--params', JSON.stringify({ key: strippedKey }), '--json'], {
+          env: enrichedEnv(),
+          timeout: 15000,
+        }, () => resolve(true)); // resolve regardless of error — files are already cleaned
+      } else {
+        resolve(true);
+      }
     });
   });
 
@@ -360,6 +404,35 @@ export function registerIpcHandlers(): void {
       content: base64,
       dataUrl: `data:${mimeType};base64,${base64}`,
     };
+  });
+
+  ipcMain.handle('chat:screenshot', async () => {
+    if (!state.mainWindow || state.mainWindow.isDestroyed()) return null;
+    // Hide our window so it doesn't appear in the screenshot
+    state.mainWindow.hide();
+    // Small delay to let the window fully hide
+    await new Promise(r => setTimeout(r, 300));
+    try {
+      const sources = await desktopCapturer.getSources({
+        types: ['screen'],
+        thumbnailSize: { width: 1920, height: 1080 },
+      });
+      if (sources.length === 0) return null;
+      const source = sources[0];
+      const nativeImage = source.thumbnail;
+      const png = nativeImage.toPNG();
+      const base64 = png.toString('base64');
+      const mimeType = 'image/png';
+      return {
+        type: 'image' as const,
+        mimeType,
+        fileName: `screenshot-${Date.now()}.png`,
+        content: base64,
+        dataUrl: `data:${mimeType};base64,${base64}`,
+      };
+    } finally {
+      state.mainWindow?.show();
+    }
   });
 
   ipcMain.handle('chat:pick-file', async () => {

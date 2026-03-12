@@ -315,7 +315,7 @@ export default function SessionSidebar({
                   )}
                 </div>
               )}
-              {pastSessions.map((s) => (
+              {[...pastSessions].sort((a, b) => isMainSession(a) ? -1 : isMainSession(b) ? 1 : 0).map((s) => (
                 <div
                   key={s.id}
                   className={`ws-session-item past-session${chatSessionKey === s.id ? ' active' : ''}${selectedSessions.has(s.id) ? ' selected' : ''}`}
@@ -327,17 +327,13 @@ export default function SessionSidebar({
                   }}
                   title={s.title}
                 >
-                  {isMainSession(s) ? (
-                    <span className="ws-session-dot active" />
-                  ) : (
-                    <input
-                      type="checkbox"
-                      className="session-checkbox"
-                      checked={selectedSessions.has(s.id)}
-                      onChange={() => toggleSessionSelection(s.id)}
-                      onClick={(e) => e.stopPropagation()}
-                    />
-                  )}
+                  <input
+                    type="checkbox"
+                    className="session-checkbox"
+                    checked={selectedSessions.has(s.id)}
+                    onChange={() => toggleSessionSelection(s.id)}
+                    onClick={(e) => e.stopPropagation()}
+                  />
                   <span className="ws-session-dot idle" />
                   <span className="ws-session-title">{isMainSession(s) ? 'Main Session' : s.title}</span>
                   <span className="ws-session-time">{formatTimeAgo(s.updatedAt)}</span>
@@ -416,11 +412,9 @@ export default function SessionSidebar({
           <div className="context-menu-item" onClick={() => onLoadPastSession(sessionContextMenu.session)}>
             Open
           </div>
-          {!isMainSession(sessionContextMenu.session) && (
-            <div className="context-menu-item danger" onClick={() => onDeletePastSession(sessionContextMenu.session)}>
-              Delete
-            </div>
-          )}
+          <div className="context-menu-item danger" onClick={() => onDeletePastSession(sessionContextMenu.session)}>
+            {isMainSession(sessionContextMenu.session) ? 'Clear History' : 'Delete'}
+          </div>
           {selectedSessions.size > 1 && (
             <div className="context-menu-item danger" onClick={onBatchDeleteSessions}>
               Delete Selected ({selectedSessions.size})

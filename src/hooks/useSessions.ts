@@ -68,9 +68,13 @@ export function useSessions(status: string) {
   };
 
   const handleDeletePastSession = async (session: PersistentSession) => {
-    if (isMainSession(session)) return;
     try {
-      await window.api.deleteSession(session.gatewayKey);
+      if (isMainSession(session)) {
+        // Main session can't be deleted — truncate its history instead
+        await window.api.clearSessionHistory(session.gatewayKey);
+      } else {
+        await window.api.deleteSession(session.gatewayKey);
+      }
       setSelectedSessions(prev => { const next = new Set(prev); next.delete(session.id); return next; });
       refreshPastSessions();
     } catch { /* ignore */ }
@@ -80,16 +84,18 @@ export function useSessions(status: string) {
   const handleBatchDeleteSessions = async () => {
     if (selectedSessions.size === 0) return;
     setBatchDeleting(true);
-    const toDelete = pastSessions.filter(s => selectedSessions.has(s.id) && !isMainSession(s));
-    await Promise.allSettled(toDelete.map(s => window.api.deleteSession(s.gatewayKey)));
+    const selected = pastSessions.filter(s => selectedSessions.has(s.id));
+    await Promise.allSettled(selected.map(s =>
+      isMainSession(s)
+        ? window.api.clearSessionHistory(s.gatewayKey)
+        : window.api.deleteSession(s.gatewayKey)
+    ));
     setSelectedSessions(new Set());
     setBatchDeleting(false);
     refreshPastSessions();
   };
 
   const toggleSessionSelection = (id: string) => {
-    const sess = pastSessions.find(s => s.id === id);
-    if (sess && isMainSession(sess)) return;
     setSelectedSessions(prev => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -98,7 +104,7 @@ export function useSessions(status: string) {
     });
   };
 
-  const deletableSessions = pastSessions.filter(s => !isMainSession(s));
+  const deletableSessions = pastSessions;
 
   const toggleSelectAllSessions = () => {
     if (selectedSessions.size === deletableSessions.length) {
