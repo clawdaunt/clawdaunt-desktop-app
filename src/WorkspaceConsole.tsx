@@ -45,6 +45,7 @@ export default function WorkspaceConsole({
   const [expandedTools, setExpandedTools] = useState<Set<string>>(new Set());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [providerMenuOpen, setProviderMenuOpen] = useState(false);
+  const [screenPermissionDenied, setScreenPermissionDenied] = useState(false);
   const providerMenuRef = useRef<HTMLDivElement>(null);
 
   // --- Hooks ---
@@ -361,6 +362,18 @@ export default function WorkspaceConsole({
                 style={{ display: 'none' }}
                 onChange={chatSend.handleFileInputChange}
               />
+              {screenPermissionDenied && (
+                <div className="screen-permission-banner">
+                  <span>Screen recording permission is required for screenshots. Open </span>
+                  <strong>System Settings → Privacy & Security → Screen Recording</strong>
+                  <span> and enable this app, then restart it.</span>
+                  <button className="screen-permission-dismiss" onClick={() => setScreenPermissionDenied(false)}>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                    </svg>
+                  </button>
+                </div>
+              )}
               <div className="chat-input-container">
                 {(chatSend.pendingImages.length > 0 || chatSend.pendingFiles.length > 0) && (
                   <div className="chat-attachment-chips">
@@ -411,34 +424,44 @@ export default function WorkspaceConsole({
                 />
 
                 <div className="chat-input-toolbar">
-                  <button
-                    className="chat-attach-btn"
-                    onClick={chatSend.handleAddAttachment}
-                    title="Add file or image"
-                    disabled={chatEvents.isStreaming}
-                  >
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <line x1="12" y1="5" x2="12" y2="19" />
-                      <line x1="5" y1="12" x2="19" y2="12" />
-                    </svg>
-                  </button>
-                  <button
-                    className="chat-attach-btn"
-                    onClick={async () => {
+                  <div className="chat-input-toolbar-left">
+                    <button
+                      className="chat-attach-btn"
+                      onClick={chatSend.handleAddAttachment}
+                      title="Add file or image"
+                      disabled={chatEvents.isStreaming}
+                    >
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <line x1="12" y1="5" x2="12" y2="19" />
+                        <line x1="5" y1="12" x2="19" y2="12" />
+                      </svg>
+                    </button>
+                    <button
+                      className="chat-attach-btn"
+                      onClick={async () => {
                       const attachment = await window.api.captureScreenshot();
                       if (attachment) {
+                        setScreenPermissionDenied(false);
                         chatSend.setPendingImages(prev => [...prev, attachment]);
+                      } else {
+                        const permission = await window.api.checkScreenPermission();
+                        if (permission !== 'granted') {
+                          setScreenPermissionDenied(true);
+                        }
                       }
                     }}
                     title="Take screenshot"
                     disabled={chatEvents.isStreaming}
                   >
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
-                      <line x1="8" y1="21" x2="16" y2="21" />
-                      <line x1="12" y1="17" x2="12" y2="21" />
+                      <circle cx="6" cy="6" r="3" />
+                      <circle cx="6" cy="18" r="3" />
+                      <line x1="20" y1="4" x2="8.12" y2="15.88" />
+                      <line x1="14.47" y1="14.48" x2="20" y2="20" />
+                      <line x1="8.12" y1="8.12" x2="12" y2="12" />
                     </svg>
                   </button>
+                  </div>
                   <div className="chat-input-toolbar-right">
                     {chatEvents.isStreaming ? (
                       <button className="chat-stop-btn" onClick={chatSend.handleAbort} title="Stop generating">

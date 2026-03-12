@@ -1,4 +1,4 @@
-import { ipcMain, dialog, desktopCapturer } from 'electron';
+import { ipcMain, dialog, systemPreferences } from 'electron';
 import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -303,9 +303,26 @@ export function registerIpcHandlers(): void {
       finalMessage = `Referenced files:\n${refList}\n\n${message}`;
     }
 
+    // Build content: use structured array if there are image attachments, plain string otherwise
+    let content: string | { type: string; text?: string; image_url?: { url: string } }[];
+    if (attachments && attachments.length > 0) {
+      content = [];
+      for (const att of attachments) {
+        content.push({
+          type: 'image_url',
+          image_url: { url: `data:${att.mimeType};base64,${att.content}` },
+        });
+      }
+      if (finalMessage) {
+        content.push({ type: 'text', text: finalMessage });
+      }
+    } else {
+      content = finalMessage;
+    }
+
     const body = JSON.stringify({
       model: 'default',
-      messages: [{ role: 'user', content: finalMessage }],
+      messages: [{ role: 'user', content }],
       stream: true,
     }, null, 0);
 
@@ -406,22 +423,24 @@ export function registerIpcHandlers(): void {
     };
   });
 
+  ipcMain.handle('chat:screen-permission', () => {
+    return systemPreferences.getMediaAccessStatus('screen');
+  });
+
   ipcMain.handle('chat:screenshot', async () => {
     if (!state.mainWindow || state.mainWindow.isDestroyed()) return null;
-    // Hide our window so it doesn't appear in the screenshot
-    state.mainWindow.hide();
-    // Small delay to let the window fully hide
-    await new Promise(r => setTimeout(r, 300));
+    const tmpFile = path.join(os.tmpdir(), `clawdaunt-screenshot-${Date.now()}.png`);
     try {
-      const sources = await desktopCapturer.getSources({
-        types: ['screen'],
-        thumbnailSize: { width: 1920, height: 1080 },
+      await new Promise<void>((resolve, reject) => {
+        execFile('/usr/sbin/screencapture', ['-i', '-x', tmpFile], (err) => {
+          if (err) return reject(err);
+          resolve();
+        });
       });
-      if (sources.length === 0) return null;
-      const source = sources[0];
-      const nativeImage = source.thumbnail;
-      const png = nativeImage.toPNG();
-      const base64 = png.toString('base64');
+      if (!fs.existsSync(tmpFile)) return null;
+      const buffer = fs.readFileSync(tmpFile);
+      fs.unlinkSync(tmpFile);
+      const base64 = buffer.toString('base64');
       const mimeType = 'image/png';
       return {
         type: 'image' as const,
@@ -430,8 +449,8 @@ export function registerIpcHandlers(): void {
         content: base64,
         dataUrl: `data:${mimeType};base64,${base64}`,
       };
-    } finally {
-      state.mainWindow?.show();
+    } catch {
+      return null;
     }
   });
 

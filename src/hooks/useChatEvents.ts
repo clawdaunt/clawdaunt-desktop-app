@@ -34,7 +34,28 @@ export function useChatEvents(chatSessionKey: string | null) {
           window.api.loadSessionHistory(key)
             .then(history => {
               if (history.length > 0) {
-                setChatMessages(history);
+                // Preserve images/files from existing messages — JSONL doesn't store them
+                setChatMessages(prev => {
+                  const userAttachments = new Map<number, { images?: string[]; files?: FileReference[] }>();
+                  let userIdx = 0;
+                  for (const m of prev) {
+                    if (m.role === 'user') {
+                      if (m.images?.length || m.files?.length) {
+                        userAttachments.set(userIdx, { images: m.images, files: m.files });
+                      }
+                      userIdx++;
+                    }
+                  }
+                  let histUserIdx = 0;
+                  return history.map(m => {
+                    if (m.role === 'user') {
+                      const saved = userAttachments.get(histUserIdx);
+                      histUserIdx++;
+                      if (saved) return { ...m, ...saved };
+                    }
+                    return m;
+                  });
+                });
               } else if (attempt < 3) {
                 setTimeout(() => loadWithRetry(attempt + 1), 1500);
               }

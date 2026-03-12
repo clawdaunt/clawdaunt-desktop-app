@@ -1,7 +1,7 @@
 {
   "name": "clawdaunt",
   "productName": "Clawdaunt",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Desktop client for connecting your expo app to PC",
   "repository": "https://github.com/clawdaunt/clawdaunt-desktop-app",
   "main": ".vite/build/main.js",

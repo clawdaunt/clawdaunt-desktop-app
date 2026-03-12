@@ -74,6 +74,7 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.invoke('chat:abort', sessionKey),
   pickImage: () => ipcRenderer.invoke('chat:pick-image'),
   pickFile: () => ipcRenderer.invoke('chat:pick-file'),
+  checkScreenPermission: () => ipcRenderer.invoke('chat:screen-permission') as Promise<string>,
   captureScreenshot: () => ipcRenderer.invoke('chat:screenshot'),
   onChatEvent: (cb: (event: { type: string; payload: Record<string, unknown> }) => void) => {
     ipcRenderer.on('chat-event', (_, event) => cb(event));

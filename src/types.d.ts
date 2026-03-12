@@ -85,6 +85,7 @@ interface ElectronAPI {
   abortChat: (sessionKey: string) => Promise<void>;
   pickImage: () => Promise<ChatAttachment | null>;
   pickFile: () => Promise<FileReference[] | null>;
+  checkScreenPermission: () => Promise<string>;
   captureScreenshot: () => Promise<ChatAttachment | null>;
   onChatEvent: (cb: (event: ChatEvent) => void) => void;
   offChatEvent: () => void;
