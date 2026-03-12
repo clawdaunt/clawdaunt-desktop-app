@@ -15,7 +15,6 @@ if (started) app.quit();
 // ── Update check ─────────────────────────────────────────────
 app.whenReady().then(() => {
   checkForUpdates();
-  setInterval(checkForUpdates, 4 * 60 * 60 * 1000);
 });
 
 // Prevent EPIPE crashes when stdout/stderr pipe is closed (e.g. packaged app with no terminal)
