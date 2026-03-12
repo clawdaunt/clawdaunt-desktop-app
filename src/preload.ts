@@ -59,6 +59,7 @@ contextBridge.exposeInMainWorld('api', {
   listSessions: () => ipcRenderer.invoke('sessions:list'),
   listPersistentSessions: () => ipcRenderer.invoke('sessions:list-persistent'),
   deleteSession: (gatewayKey: string) => ipcRenderer.invoke('sessions:delete', gatewayKey),
+  clearSessionHistory: (sessionKey: string) => ipcRenderer.invoke('sessions:clear-history', sessionKey),
   loadSessionHistory: (sessionKey: string) => ipcRenderer.invoke('sessions:load-history', sessionKey),
   onSessionsUpdated: (cb: (sessions: GatewaySession[]) => void) => {
     ipcRenderer.on('sessions-updated', (_, sessions) => cb(sessions));
@@ -73,6 +74,8 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.invoke('chat:abort', sessionKey),
   pickImage: () => ipcRenderer.invoke('chat:pick-image'),
   pickFile: () => ipcRenderer.invoke('chat:pick-file'),
+  checkScreenPermission: () => ipcRenderer.invoke('chat:screen-permission') as Promise<string>,
+  captureScreenshot: () => ipcRenderer.invoke('chat:screenshot'),
   onChatEvent: (cb: (event: { type: string; payload: Record<string, unknown> }) => void) => {
     ipcRenderer.on('chat-event', (_, event) => cb(event));
   },
